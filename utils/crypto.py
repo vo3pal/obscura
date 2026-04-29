@@ -91,14 +91,3 @@ def generate_mba(n: int, depth: int, rng: random.Random) -> str:
 def generate_rotating_key(length: int, rng: random.Random) -> List[int]:
     """Generate a multi-byte rotating XOR key."""
     return [rng.randint(1, 255) for _ in range(length)]
-
-
-def string_to_ascii_escapes(s: str) -> str:
-    """Convert a string to Luau ASCII escape sequence form."""
-    return ''.join(f'\\{b}' for b in s.encode('utf-8'))
-
-
-def string_to_byte_array(s: str) -> str:
-    """Convert string to string.char() call."""
-    bytes_list = ', '.join(str(b) for b in s.encode('utf-8'))
-    return f"string.char({bytes_list})"

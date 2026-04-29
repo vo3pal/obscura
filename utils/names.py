@@ -97,9 +97,6 @@ class NameGenerator:
     def gen_xor_key(self) -> int:
         return self.rng.randint(1, 255)
 
-    def gen_large_key(self) -> int:
-        return self.rng.randint(0x100, 0xFFFF)
-
     def reset(self):
         self._used_names.clear()
         self._counter = 0

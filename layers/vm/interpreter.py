@@ -31,23 +31,29 @@ class InterpreterGenerator:
         v = self._gen_var_names()
         parts = []
 
-        # 1. Constant pool key and decoder
-        key_name, key_code = self.pool.generate_key_table(self.name_gen)
-        parts.append(key_code)
-
-        pool_data = self.pool.to_luau_string()
-        pool_var = self.name_gen.gen_name()
-        parts.append(f"local {pool_var}={pool_data}")
-
-        decoder_name, decoder_code = self.pool.generate_decoder(
-            self.name_gen.gen_name(), self.name_gen.gen_name(), self.name_gen
-        )
-        parts.append(decoder_code)
-
-        # 2. Decoded constants
+        # 1. Generate per-string XOR keys and encrypted const table
+        str_xor_key = self.rng.randint(1, 255)
         consts_var = self.name_gen.gen_name()
-        const_entries = self._generate_const_table()
+        const_entries = self._generate_const_table(str_xor_key)
+        key_var = self.name_gen.gen_name()
+        parts.append(f"local {key_var}={str_xor_key}")
         parts.append(f"local {consts_var}={const_entries}")
+        # Decrypt string entries at runtime
+        dec_i = self.name_gen.gen_name()
+        dec_s = self.name_gen.gen_name()
+        dec_r = self.name_gen.gen_name()
+        dec_b = self.name_gen.gen_name()
+        parts.append(
+            f"for {dec_i},_v in ipairs({consts_var}) do "
+            f"if type(_v)==\"string\" then "
+            f"local {dec_r}={{}} "
+            f"for {dec_s}=1,#_v do "
+            f"local {dec_b}=string.byte(_v,{dec_s}) "
+            f"{dec_r}[{dec_s}]=string.char(bit32.bxor({dec_b},{key_var})) "
+            f"end "
+            f"{consts_var}[{dec_i}]=table.concat({dec_r}) "
+            f"end end"
+        )
 
         # 3. Bytecode as table
         bc_var = self.name_gen.gen_name()
@@ -77,8 +83,8 @@ class InterpreterGenerator:
 
         return '\n'.join(parts)
 
-    def _generate_const_table(self) -> str:
-        """Generate the constant pool as a direct Luau table literal."""
+    def _generate_const_table(self, xor_key: int) -> str:
+        """Generate the constant pool as a Luau table literal with strings XOR-encrypted."""
         entries = []
         for const in self.pool.constants:
             if const is None:
@@ -88,8 +94,8 @@ class InterpreterGenerator:
             elif isinstance(const, (int, float)):
                 entries.append(str(const))
             elif isinstance(const, str):
-                escaped = const.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r').replace('\0', '\\0')
-                entries.append(f'"{escaped}"')
+                encrypted = ''.join(f'\\{b ^ xor_key}' for b in const.encode('utf-8'))
+                entries.append(f'"{encrypted}"')
             else:
                 entries.append("nil")
         return '{' + ','.join(entries) + '}'

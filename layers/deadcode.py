@@ -177,30 +177,3 @@ class DeadCodeInjector:
             ),
         ]))
 
-    def _gen_noop_computation(self) -> Node:
-        """Generate a computation that runs but does nothing meaningful."""
-        var = self.name_gen.gen_name()
-        val = self.rng.randint(1, 100)
-        # local x = val; x = x + 1; x = x - 1  (net zero effect)
-        return DoBlock(body=Block(body=[
-            LocalStatement(
-                names=[var],
-                values=[NumberLiteral(value=str(val))]
-            ),
-            AssignStatement(
-                targets=[Identifier(name=var)],
-                values=[BinaryOp(
-                    op='+',
-                    left=Identifier(name=var),
-                    right=NumberLiteral(value='1')
-                )]
-            ),
-            AssignStatement(
-                targets=[Identifier(name=var)],
-                values=[BinaryOp(
-                    op='-',
-                    left=Identifier(name=var),
-                    right=NumberLiteral(value='1')
-                )]
-            ),
-        ]))

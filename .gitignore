@@ -18,6 +18,7 @@ ENV/
 .idea/
 
 # Project Specific
+script.lua
 output.lua
 output_vm.lua
 *.obf.lua

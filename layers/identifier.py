@@ -10,7 +10,7 @@ from parser.scope import Scope, ScopeAnalyzer
 from utils.names import NameGenerator
 from utils.globals import is_renameable
 from config import ObfuscationConfig
-from typing import Dict, Optional
+from typing import Optional
 
 
 class IdentifierRenamer:

@@ -6,7 +6,7 @@ builds a centralized string table, and injects a polymorphic decoder.
 """
 
 from parser.ast_nodes import *
-from utils.crypto import encrypt_string, string_to_ascii_escapes
+from utils.crypto import encrypt_string
 from utils.names import NameGenerator
 from config import ObfuscationConfig
 from typing import List, Tuple
@@ -179,11 +179,3 @@ class StringEncryptor:
         }
         return DECODER_TEMPLATE.format(**names)
 
-    def get_decoder_code(self) -> str:
-        """Get the decoder function as raw Luau code."""
-        return self._generate_decoder()
-
-    def get_string_table_code(self) -> str:
-        """Get the string table as raw Luau code."""
-        entries = ','.join(f'"{enc}"' for _, enc, _ in self.strings)
-        return f"local {self.table_name}={{{entries}}}"

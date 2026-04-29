@@ -153,14 +153,7 @@ class Obfuscator:
         )
         vm_output = interpreter_gen.generate(main_proto)
 
-        # Construct the final code
-        code_parts = [
-            "print('Obscura VM Protected Script Loading...')",
-            "print('Obscura VM Payload Initializing...')",
-            vm_output
-        ]
-        
-        final_code = " ".join(code_parts)
+        final_code = vm_output
         
         # Wrap in IIFE if configured
         if self.config.wrap_in_iife:

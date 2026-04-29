@@ -166,8 +166,6 @@ class AntiTamperInjector:
 
         return [backup] + checks
 
-        return []
-
     def _gen_integrity_check(self) -> List[Node]:
         """Generate function integrity verification."""
         fn_sig = self.name_gen.gen_name()

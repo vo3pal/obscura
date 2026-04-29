@@ -70,7 +70,6 @@ class ObfuscationConfig:
     # Anti-tamper
     check_environment: bool = True
     check_hooks: bool = True
-    check_timing: bool = True
     check_integrity: bool = True
     wrap_in_iife: bool = True
 
@@ -96,33 +95,16 @@ class ObfuscationConfig:
 
     def _apply_level(self, level: ProtectionLevel):
         """Apply a protection level preset, setting layer toggles."""
-        # Reset all
-        self.rename_identifiers = False
-        self.encrypt_strings = False
-        self.obfuscate_numbers = False
-        self.control_flow_flatten = False
-        self.opaque_predicates = False
-        self.inject_dead_code = False
-        self.table_indirection = False
-        self.anti_tamper = False
-        self.virtualize = False
-
-        if level.value >= ProtectionLevel.MINIMAL.value:
-            self.rename_identifiers = True
-            self.encrypt_strings = True
-            self.obfuscate_numbers = True
-
-        if level.value >= ProtectionLevel.STANDARD.value:
-            self.control_flow_flatten = True
-            self.opaque_predicates = True
-            self.inject_dead_code = True
-
-        if level.value >= ProtectionLevel.MAXIMUM.value:
-            self.table_indirection = True
-            self.anti_tamper = True
-
-        if level.value >= ProtectionLevel.PARANOID.value:
-            self.virtualize = True
+        lv = level.value
+        self.rename_identifiers = lv >= ProtectionLevel.MINIMAL.value
+        self.encrypt_strings = lv >= ProtectionLevel.MINIMAL.value
+        self.obfuscate_numbers = lv >= ProtectionLevel.MINIMAL.value
+        self.control_flow_flatten = lv >= ProtectionLevel.STANDARD.value
+        self.opaque_predicates = lv >= ProtectionLevel.STANDARD.value
+        self.inject_dead_code = lv >= ProtectionLevel.STANDARD.value
+        self.table_indirection = lv >= ProtectionLevel.MAXIMUM.value
+        self.anti_tamper = lv >= ProtectionLevel.MAXIMUM.value
+        self.virtualize = lv >= ProtectionLevel.PARANOID.value
 
     def _init_rng(self):
         """Initialize the random number generator."""

@@ -9,7 +9,6 @@ Usage:
     python main.py --input script.lua --level 4 --vm --antitamper --seed 12345
 """
 
-import os
 import sys
 import time
 import pathlib
