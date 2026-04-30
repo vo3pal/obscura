@@ -1,131 +1,146 @@
 """
 Obscura VM Opcodes
 ======================
-Defines the custom instruction set for the virtual machine.
-Opcode values are randomized per-build (polymorphic).
+Register-based instruction set with per-build randomized values AND
+multiple aliases per semantic opcode (multiple distinct byte values that
+map to the same handler). Defeats opcode-frequency analysis.
 """
 
 import random
-from dataclasses import dataclass
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple
+
+from .instruction import (
+    FORMAT_NONE, FORMAT_A, FORMAT_AB, FORMAT_ABC,
+    FORMAT_ABX, FORMAT_ASBX, FORMAT_SBX, instruction_size,
+)
+
+
+# (name, format, default_alias_count)
+INSTRUCTION_DEFS: List[Tuple[str, str, int]] = [
+    # Movement / loading
+    ('MOVE',      FORMAT_AB,   2),
+    ('LOADK',     FORMAT_ABX,  3),
+    ('LOADBOOL',  FORMAT_ABC,  1),
+    ('LOADNIL',   FORMAT_AB,   1),
+
+    # Upvalues / globals
+    ('GETUPVAL',  FORMAT_AB,   2),
+    ('SETUPVAL',  FORMAT_AB,   2),
+    ('GETGLOBAL', FORMAT_ABX,  2),
+    ('SETGLOBAL', FORMAT_ABX,  2),
+
+    # Tables
+    ('NEWTABLE',  FORMAT_ABC,  1),
+    ('GETTABLE',  FORMAT_ABC,  2),
+    ('SETTABLE',  FORMAT_ABC,  2),
+    ('GETTABLEK', FORMAT_ABC,  2),
+    ('SETTABLEK', FORMAT_ABC,  2),
+    ('SELF',      FORMAT_ABC,  1),
+    ('SETLIST',   FORMAT_ABC,  1),
+
+    # Arithmetic
+    ('ADD',       FORMAT_ABC,  3),
+    ('SUB',       FORMAT_ABC,  3),
+    ('MUL',       FORMAT_ABC,  2),
+    ('DIV',       FORMAT_ABC,  2),
+    ('MOD',       FORMAT_ABC,  1),
+    ('POW',       FORMAT_ABC,  1),
+    ('UNM',       FORMAT_AB,   1),
+    ('NOT',       FORMAT_AB,   1),
+    ('LEN',       FORMAT_AB,   1),
+    ('CONCAT',    FORMAT_ABC,  1),
+
+    # Comparison + conditional jump
+    ('EQ',        FORMAT_ABC,  2),
+    ('LT',        FORMAT_ABC,  2),
+    ('LE',        FORMAT_ABC,  1),
+    ('TEST',      FORMAT_AB,   2),
+    ('TESTSET',   FORMAT_ABC,  1),
+
+    # Control flow
+    ('JMP',       FORMAT_SBX,  3),
+    ('CALL',      FORMAT_ABC,  3),
+    ('TAILCALL',  FORMAT_ABC,  1),
+    ('RETURN',    FORMAT_AB,   2),
+
+    # Loop helpers
+    ('FORPREP',   FORMAT_ASBX, 1),
+    ('FORLOOP',   FORMAT_ASBX, 1),
+    ('TFORLOOP',  FORMAT_ABC,  1),
+
+    # Closures / varargs
+    ('CLOSURE',   FORMAT_ABX,  2),
+    ('VARARG',    FORMAT_AB,   1),
+
+    # Captured-local boxes (proper closure semantics)
+    ('MKBOX',     FORMAT_AB,   1),  # R[A] := {R[B]}      box wraps a value
+    ('GETBOX',    FORMAT_AB,   2),  # R[A] := R[B][1]     read boxed local
+    ('SETBOX',    FORMAT_AB,   2),  # R[A][1] := R[B]     write boxed local
+
+    # No-op
+    ('NOP',       FORMAT_NONE, 2),
+]
 
 
 @dataclass
 class OpcodeInfo:
-    """Information about a single VM opcode."""
-    name: str           # Human-readable name
-    value: int          # Numeric opcode value (randomized per build)
-    operand_count: int  # Number of operands following the opcode
+    name: str
+    fmt: str
+    aliases: List[int] = field(default_factory=list)
 
-
-# All supported VM instructions
-INSTRUCTION_NAMES = [
-    # Stack operations
-    ('PUSH_CONST', 1),     # Push constant from pool: [idx]
-    ('PUSH_LOCAL', 1),     # Push local variable: [slot]
-    ('SET_LOCAL', 1),      # Pop -> local variable: [slot]
-    ('PUSH_UPVAL', 1),     # Push upvalue: [idx]
-    ('SET_UPVAL', 1),      # Pop -> upvalue: [idx]
-    ('PUSH_NIL', 0),       # Push nil
-    ('PUSH_TRUE', 0),      # Push true
-    ('PUSH_FALSE', 0),     # Push false
-    ('POP', 0),            # Discard top of stack
-
-    # Arithmetic
-    ('ADD', 0),            # Pop 2, push sum
-    ('SUB', 0),            # Pop 2, push difference
-    ('MUL', 0),            # Pop 2, push product
-    ('DIV', 0),            # Pop 2, push quotient
-    ('MOD', 0),            # Pop 2, push remainder
-    ('POW', 0),            # Pop 2, push power
-    ('UNM', 0),            # Negate top of stack
-    ('CONCAT', 1),         # Concatenate N strings: [count]
-
-    # Comparison
-    ('EQ', 0),             # Pop 2, push ==
-    ('LT', 0),             # Pop 2, push <
-    ('LE', 0),             # Pop 2, push <=
-    ('NOT', 0),            # Logical not
-    ('LEN', 0),            # Length operator #
-
-    # Control flow
-    ('JMP', 2),            # Unconditional jump: [offset_lo, offset_hi]
-    ('JMP_FALSE', 2),      # Jump if falsy: [offset_lo, offset_hi]
-    ('JMP_TRUE', 2),       # Jump if truthy: [offset_lo, offset_hi]
-
-    # Functions
-    ('CALL', 2),           # Call function: [argc, retc]
-    ('RETURN', 1),         # Return values: [count]
-    ('CLOSURE', 1),        # Create closure: [proto_idx]
-    ('VARARG', 1),         # Push varargs: [count]
-
-    # Globals
-    ('GET_GLOBAL', 1),     # Push global: [const_idx for name]
-    ('SET_GLOBAL', 1),     # Pop -> global: [const_idx for name]
-
-    # Tables
-    ('NEW_TABLE', 2),      # Create table: [array_size, hash_size]
-    ('GET_TABLE', 0),      # Pop key, pop table, push table[key]
-    ('SET_TABLE', 0),      # Pop value, pop key, pop table, table[key]=value
-    ('SET_LIST', 2),       # Set list entries: [start_idx, count]
-
-    # Special
-    ('MOVE', 2),           # Copy local: [dest, src]
-    ('DUP', 0),            # Duplicate top of stack
-    ('SWAP', 0),           # Swap top two elements
-    ('NOP', 0),            # No operation (junk instruction)
-]
+    @property
+    def primary(self) -> int:
+        return self.aliases[0]
 
 
 class OpcodeMap:
     """
-    Manages the mapping between instruction names and their numeric values.
-    Values are randomized per-build for polymorphism.
+    Maps semantic opcode names to one or more byte values (aliases).
+    All byte values are unique across the whole map.
     """
+
+    _RESERVED = {0}
 
     def __init__(self, rng: random.Random):
         self.rng = rng
         self.opcodes: Dict[str, OpcodeInfo] = {}
         self._by_value: Dict[int, OpcodeInfo] = {}
-        self._generate_mapping()
+        self._generate()
 
-    def _generate_mapping(self):
-        """Generate randomized opcode values for this build."""
-        # Generate unique random values for each instruction
-        values = self.rng.sample(range(1, 256), len(INSTRUCTION_NAMES))
+    def _generate(self):
+        total_aliases = sum(count for _, _, count in INSTRUCTION_DEFS)
+        available = [v for v in range(1, 256) if v not in self._RESERVED]
+        if total_aliases > len(available):
+            raise RuntimeError(f"Too many opcode aliases: {total_aliases} > {len(available)}")
 
-        for (name, operand_count), value in zip(INSTRUCTION_NAMES, values):
-            info = OpcodeInfo(name=name, value=value, operand_count=operand_count)
+        chosen = self.rng.sample(available, total_aliases)
+        idx = 0
+        for name, fmt, count in INSTRUCTION_DEFS:
+            aliases = chosen[idx:idx + count]
+            idx += count
+            info = OpcodeInfo(name=name, fmt=fmt, aliases=aliases)
             self.opcodes[name] = info
-            self._by_value[value] = info
+            for v in aliases:
+                self._by_value[v] = info
 
-    def get(self, name: str) -> int:
-        """Get the numeric opcode value for an instruction name."""
-        return self.opcodes[name].value
-
-    def get_info(self, name: str) -> OpcodeInfo:
-        """Get full opcode info by name."""
+    def get(self, name: str) -> OpcodeInfo:
         return self.opcodes[name]
 
-    def from_value(self, value: int) -> OpcodeInfo:
-        """Look up opcode info by numeric value."""
-        return self._by_value.get(value)
+    def primary(self, name: str) -> int:
+        return self.opcodes[name].primary
 
-    def get_all(self) -> Dict[str, OpcodeInfo]:
-        """Get all opcode mappings."""
-        return dict(self.opcodes)
+    def random_alias(self, name: str) -> int:
+        return self.rng.choice(self.opcodes[name].aliases)
 
-    def generate_luau_constants(self, name_gen) -> str:
-        """Generate Luau local declarations for all opcode constants."""
-        lines = []
-        # Shuffle the order for additional obfuscation
-        items = list(self.opcodes.items())
-        self.rng.shuffle(items)
+    def fmt_of(self, name: str) -> str:
+        return self.opcodes[name].fmt
 
-        opcode_names = {}
-        for name, info in items:
-            var_name = name_gen.gen_name()
-            opcode_names[name] = var_name
-            lines.append(f"local {var_name}={info.value}")
+    def all_aliases(self) -> List[Tuple[int, OpcodeInfo]]:
+        return list(self._by_value.items())
 
-        return '\n'.join(lines), opcode_names
+    def fmt_of_byte(self, byte: int) -> str:
+        return self._by_value[byte].fmt
+
+    def name_of_byte(self, byte: int) -> str:
+        return self._by_value[byte].name

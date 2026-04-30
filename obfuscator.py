@@ -154,10 +154,12 @@ class Obfuscator:
         vm_output = interpreter_gen.generate(main_proto)
 
         final_code = vm_output
-        
-        # Wrap in IIFE if configured
+
+        # Wrap in IIFE if configured. We must forward `...` so the VM's main
+        # chunk receives the script-level varargs (Roblox passes none, but
+        # standalone Lua may).
         if self.config.wrap_in_iife:
-            final_code = f"(function() {final_code} end)()"
+            final_code = f"(function(...) {final_code} end)(...)"
 
         # Ensure everything after the header is on a single line
         final_code = final_code.replace('\n', ' ').replace('\r', ' ')

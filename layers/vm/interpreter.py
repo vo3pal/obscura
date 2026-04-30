@@ -1,22 +1,84 @@
 """
-Obscura VM Interpreter Generator
-=====================================
-Generates the polymorphic Luau interpreter stub that gets embedded in the output.
-This is the runtime VM that executes custom bytecode in Roblox.
-IMPORTANT: All output must be valid Roblox Luau syntax.
+Obscura VM Interpreter Generator (Register-Based, Encrypted Bytecode)
+=========================================================================
+Emits the Luau/Lua runtime that executes register-based VM bytecode.
+
+Compatibility
+-------------
+The generated runtime works in:
+  * Roblox Studio (Luau)
+  * Lua 5.1 / 5.2 / 5.3 / 5.4 (where bit32 or bit lib exists, otherwise a
+    pure-Lua XOR helper is emitted)
+  * LuaJIT
+
+It avoids using:
+  * Lua 5.3+ bitwise operators (`~`, `&`, `|`)
+  * `goto` (not supported by Luau)
+  * `string.unpack` (Lua 5.3+ only)
+
+It uses:
+  * `bit32.bxor` if present (Roblox + Luau + Lua 5.2)
+  * `bit.bxor` if present (LuaJIT)
+  * pure-Lua byte XOR fallback otherwise
+  * `unpack` if present, else `table.unpack` (Lua 5.2+)
+  * `getfenv()` if present, else `_G` (for the global environment)
+
+Per-build polymorphism
+----------------------
+  * Opcode byte values are randomized
+  * Multiple aliases (distinct bytes) map to the same handler
+  * Bytecode is encrypted with a per-build rolling XOR cipher
+  * Constant pool strings are encrypted with a separate rolling XOR cipher
+  * All variable names in the runtime are obfuscated
+  * Handler order in the if/elseif chain is randomized
 """
 
 import random
+from typing import Dict, List
+
 from .opcodes import OpcodeMap
 from .constant_pool import ConstantPool
-from .compiler import VMCompiler, FunctionPrototype
+from .proto import FunctionPrototype
+from .instruction import (
+    FORMAT_NONE, FORMAT_A, FORMAT_AB, FORMAT_ABC,
+    FORMAT_ABX, FORMAT_ASBX, FORMAT_SBX, instruction_size,
+)
 from utils.names import NameGenerator
 from config import ObfuscationConfig
-from typing import Dict, List
+
+
+# ---------------------------------------------------------------------------
+# Roblox / Luau / Lua globals whitelist — these must always resolve via
+# the global environment (getfenv()/_G). The compiler already handles this
+# automatically by emitting GETGLOBAL for any name that isn't a local or
+# upvalue. We document the list here for reference.
+# ---------------------------------------------------------------------------
+ROBLOX_GLOBALS = {
+    # Roblox runtime
+    'game', 'workspace', 'script', 'shared', 'plugin', 'DebuggerManager',
+    'Instance', 'Vector3', 'Vector2', 'CFrame', 'Color3', 'BrickColor',
+    'UDim', 'UDim2', 'Ray', 'Region3', 'Enum', 'Random', 'TweenInfo',
+    'NumberRange', 'NumberSequence', 'NumberSequenceKeypoint',
+    'ColorSequence', 'ColorSequenceKeypoint', 'Rect', 'Faces',
+    'Axes', 'PathWaypoint', 'PhysicalProperties',
+    # Roblox task lib
+    'task', 'wait', 'spawn', 'delay', 'tick', 'time', 'elapsedTime',
+    # Standard libs
+    'string', 'table', 'math', 'os', 'io', 'coroutine', 'debug',
+    'bit32', 'bit', 'utf8',
+    # Globals
+    'pairs', 'ipairs', 'next', 'select', 'unpack', 'tonumber', 'tostring',
+    'type', 'typeof', 'assert', 'error', 'pcall', 'xpcall',
+    'rawget', 'rawset', 'rawequal', 'rawlen',
+    'setmetatable', 'getmetatable', 'newproxy',
+    'print', 'warn', 'require', 'collectgarbage', 'loadstring',
+    'getfenv', 'setfenv', 'gcinfo',
+    '_G', '_ENV', '_VERSION',
+}
 
 
 class InterpreterGenerator:
-    """Generates a polymorphic Luau VM interpreter stub."""
+    """Generates the Luau runtime that executes our register-based bytecode."""
 
     def __init__(self, config: ObfuscationConfig, opcodes: OpcodeMap,
                  pool: ConstantPool, name_gen: NameGenerator):
@@ -25,215 +87,568 @@ class InterpreterGenerator:
         self.opcodes = opcodes
         self.pool = pool
         self.name_gen = name_gen
+        # Per-build rolling key for bytecode stream encryption
+        klen = self.rng.randint(4, 16)
+        self.bc_key: List[int] = [self.rng.randint(1, 255) for _ in range(klen)]
+
+    # =================================================================
+    # Public entry
+    # =================================================================
 
     def generate(self, main_proto: FunctionPrototype) -> str:
-        """Generate the complete VM stub: decoder + interpreter + bytecode + entry point."""
-        v = self._gen_var_names()
-        parts = []
+        names = self._gen_names()
+        parts: List[str] = []
 
-        # 1. Generate per-string XOR keys and encrypted const table
-        str_xor_key = self.rng.randint(1, 255)
-        consts_var = self.name_gen.gen_name()
-        const_entries = self._generate_const_table(str_xor_key)
-        key_var = self.name_gen.gen_name()
-        parts.append(f"local {key_var}={str_xor_key}")
-        parts.append(f"local {consts_var}={const_entries}")
-        # Decrypt string entries at runtime
-        dec_i = self.name_gen.gen_name()
-        dec_s = self.name_gen.gen_name()
-        dec_r = self.name_gen.gen_name()
-        dec_b = self.name_gen.gen_name()
-        parts.append(
-            f"for {dec_i},_v in ipairs({consts_var}) do "
-            f"if type(_v)==\"string\" then "
-            f"local {dec_r}={{}} "
-            f"for {dec_s}=1,#_v do "
-            f"local {dec_b}=string.byte(_v,{dec_s}) "
-            f"{dec_r}[{dec_s}]=string.char(bit32.bxor({dec_b},{key_var})) "
-            f"end "
-            f"{consts_var}[{dec_i}]=table.concat({dec_r}) "
-            f"end end"
-        )
+        # 1. Compatibility shims
+        parts.append(self._gen_compat_shims(names))
 
-        # 3. Bytecode as table
-        bc_var = self.name_gen.gen_name()
-        bc_entries = ','.join(str(b) for b in main_proto.bytecode)
-        parts.append(f"local {bc_var}={{{bc_entries}}}")
+        # 2. Constant pool key + decode
+        parts.append(self._gen_constant_pool(names))
 
-        # 4. Sub-prototypes bytecode
-        proto_vars = []
-        for i, proto in enumerate(main_proto.sub_protos):
-            pv = self.name_gen.gen_name()
-            proto_vars.append(pv)
-            pe = ','.join(str(b) for b in proto.bytecode)
-            parts.append(f"local {pv}={{{pe}}}")
+        # 3. Bytecode key
+        parts.append(self._gen_bytecode_key(names))
 
-        proto_tbl = self.name_gen.gen_name()
-        if proto_vars:
-            parts.append(f"local {proto_tbl}={{{','.join(proto_vars)}}}")
-        else:
-            parts.append(f"local {proto_tbl}={{}}")
+        # 4. Encrypt all proto bytecodes and emit them as data tables
+        all_protos = self._flatten_protos(main_proto)
+        parts.append(self._gen_protos(names, all_protos))
 
-        # 5. The VM interpreter function
-        vm_code = self._generate_vm_function(v, consts_var, proto_tbl)
-        parts.append(vm_code)
+        # 5. Lookup tables used by the exec function (must come BEFORE exec).
+        parts.append(self._gen_lookup_tables(names))
 
-        # 6. Entry point
-        parts.append(f"return {v['vm_func']}({bc_var},{consts_var},{v['empty_env']},{proto_tbl})")
+        # 6. The exec function
+        parts.append(self._gen_exec_function(names))
+
+        # 7. Entry point
+        parts.append(self._gen_entry(names))
 
         return '\n'.join(parts)
 
-    def _generate_const_table(self, xor_key: int) -> str:
-        """Generate the constant pool as a Luau table literal with strings XOR-encrypted."""
-        entries = []
-        for const in self.pool.constants:
-            if const is None:
-                entries.append("nil")
-            elif isinstance(const, bool):
-                entries.append("true" if const else "false")
-            elif isinstance(const, (int, float)):
-                entries.append(str(const))
-            elif isinstance(const, str):
-                encrypted = ''.join(f'\\{b ^ xor_key}' for b in const.encode('utf-8'))
-                entries.append(f'"{encrypted}"')
-            else:
-                entries.append("nil")
-        return '{' + ','.join(entries) + '}'
+    # =================================================================
+    # Names
+    # =================================================================
 
-    def _gen_var_names(self) -> Dict[str, str]:
-        """Generate all variable names used in the interpreter."""
+    def _gen_names(self) -> Dict[str, str]:
         keys = [
-            'vm_func', 'bytecode', 'constants', 'env',
-            'stack', 'locals_tbl', 'ip', 'sp', 'op',
-            'push_fn', 'pop_fn', 'a', 'b', 'result',
-            'func', 'args', 'argc', 'retc', 'ret_vals',
-            'i', 'key', 'val', 'tbl', 'offset',
-            'empty_env', 'proto_tbl', 'passed_args'
+            # Globals
+            'bxor', 'unpack', 'env',
+            # Tables
+            'consts', 'ck', 'ckn',
+            'bk', 'bkn',
+            'protos',
+            # Exec function and locals
+            'exec', 'proto', 'upvals', 'varargs',
+            'R', 'pc', 'bc', 'sp', 'top', 'op',
+            # Operand temps
+            'a', 'b', 'c', 'tmp', 'tmp2', 'tmp3',
+            # Helpers
+            'rd16', 'rds16',
+            # Loop locals
+            'i', 'j', 'k', 'n',
+            # CLOSURE temps
+            'newuv', 'newproto', 'pop', 'pa', 'pb',
+            # CALL temps
+            'fn', 'args', 'nargs', 'nret', 'rets',
+            # Misc
+            'box',
+            # Lookup tables (declared before exec so it can capture them)
+            'opsize', 'ismove',
         ]
-        return {k: self.name_gen.gen_name() for k in keys}
+        out = {}
+        for k in keys:
+            out[k] = self.name_gen.gen_name()
+        return out
 
-    def _generate_vm_function(self, v: Dict[str, str], consts_var: str, proto_tbl: str) -> str:
-        """Generate the VM interpreter function in Luau."""
-        ops = self.opcodes
+    # =================================================================
+    # Compatibility shims (bit ops, unpack, env)
+    # =================================================================
 
-        # Build handler cases
-        handlers = self._build_handlers(v, ops)
-
-        # Shuffle handler order for polymorphism
-        self.rng.shuffle(handlers)
-
-        # Build proper if/elseif/end chain
-        handler_chain = self._build_if_chain(handlers, v['op'])
-
-        vm_code = f"""local {v['empty_env']}={{}}
-local function {v['vm_func']}({v['bytecode']},{v['constants']},{v['env']},{v['proto_tbl']},{v['passed_args']})
-local {v['stack']}={{}}
-local {v['locals_tbl']}={v['passed_args']} or {{}}
-local {v['ip']}=1
-local {v['sp']}=0
-local function {v['push_fn']}({v['val']})
-{v['sp']}={v['sp']}+1
-{v['stack']}[{v['sp']}]={v['val']}
+    def _gen_compat_shims(self, n: Dict[str, str]) -> str:
+        return f"""local {n['bxor']}=(bit32 and bit32.bxor) or (bit and bit.bxor) or (function()
+local function _x(a,b)
+local r,p=0,1
+for _=1,8 do
+local ab,bb=a%2,b%2
+if ab~=bb then r=r+p end
+a=(a-ab)/2;b=(b-bb)/2;p=p*2
 end
-local function {v['pop_fn']}()
-local {v['val']}={v['stack']}[{v['sp']}]
-{v['sp']}={v['sp']}-1
-return {v['val']}
+return r
 end
-while {v['ip']}<=#({v['bytecode']}) do
-local {v['op']}={v['bytecode']}[{v['ip']}]
-{v['ip']}={v['ip']}+1
-{handler_chain}
+return _x
+end)()
+local {n['unpack']}=unpack or table.unpack
+local {n['env']}=(getfenv and getfenv()) or _G"""
+
+    # =================================================================
+    # Constant pool emission + runtime string decryption
+    # =================================================================
+
+    def _gen_constant_pool(self, n: Dict[str, str]) -> str:
+        key_entries = ','.join(str(k) for k in self.pool.key)
+        consts_table = self.pool.to_luau_table()
+        # Decrypt strings on startup (eager)
+        return f"""local {n['ck']}={{{key_entries}}}
+local {n['ckn']}=#{n['ck']}
+local {n['consts']}={consts_table}
+for {n['i']},{n['tmp']} in ipairs({n['consts']}) do
+if type({n['tmp']})=="string" then
+local {n['tmp2']}={{}}
+for {n['j']}=1,#{n['tmp']} do
+{n['tmp2']}[{n['j']}]=string.char({n['bxor']}(string.byte({n['tmp']},{n['j']}),{n['ck']}[({n['j']}-1)%{n['ckn']}+1]))
+end
+{n['consts']}[{n['i']}]=table.concat({n['tmp2']})
 end
 end"""
-        return vm_code
 
-    def _build_if_chain(self, handlers: List[dict], op_var: str) -> str:
-        """Build a proper if/elseif/end chain from handler dicts."""
-        if not handlers:
-            return ""
+    # =================================================================
+    # Bytecode key
+    # =================================================================
 
-        lines = []
-        for i, h in enumerate(handlers):
-            keyword = "if" if i == 0 else "elseif"
-            lines.append(f"{keyword} {op_var}=={h['value']} then")
-            lines.append(h['body'])
-        lines.append("end")
+    def _gen_bytecode_key(self, n: Dict[str, str]) -> str:
+        return f"""local {n['bk']}={{{','.join(str(k) for k in self.bc_key)}}}
+local {n['bkn']}=#{n['bk']}"""
+
+    # =================================================================
+    # Proto serialization
+    # =================================================================
+
+    def _flatten_protos(self, root: FunctionPrototype) -> List[FunctionPrototype]:
+        """Flatten nested protos into a flat list with rewritten sub-proto refs.
+
+        Returns a list where index 0 is the root. Each proto's `sub_protos`
+        list (which may contain duplicate entries) is converted into indices
+        into this flat list and stored in a parallel list `sp_indices`.
+        """
+        flat: List[FunctionPrototype] = []
+        sp_indices: Dict[int, List[int]] = {}  # id(proto) -> list of flat indices
+
+        def walk(p: FunctionPrototype) -> int:
+            idx = len(flat)
+            flat.append(p)
+            child_indices: List[int] = []
+            for child in p.sub_protos:
+                child_idx = walk(child)
+                child_indices.append(child_idx)
+            sp_indices[id(p)] = child_indices
+            return idx
+
+        walk(root)
+        # Stash sp_indices as an attribute on each proto for emission
+        for p in flat:
+            p._sp_indices = sp_indices[id(p)]
+        return flat
+
+    def _encrypt_bytecode(self, bc: List[int]) -> List[int]:
+        """Apply rolling XOR with bc_key to the byte stream.
+
+        The runtime decrypts using key index `(pc-1) % klen + 1` (Lua 1-based).
+        """
+        klen = len(self.bc_key)
+        return [b ^ self.bc_key[i % klen] for i, b in enumerate(bc)]
+
+    def _gen_protos(self, n: Dict[str, str], protos: List[FunctionPrototype]) -> str:
+        """Emit the table of all proto data."""
+        lines = [f"local {n['protos']}={{}}"]
+        for i, p in enumerate(protos):
+            enc_bc = self._encrypt_bytecode(p.bytecode)
+            bc_str = ','.join(str(b) for b in enc_bc)
+            sp_str = ','.join(str(idx + 1) for idx in p._sp_indices)  # Lua 1-based
+            lines.append(
+                f"{n['protos']}[{i + 1}]="
+                f"{{bc={{{bc_str}}},"
+                f"np={p.num_params},"
+                f"va={'true' if p.is_vararg else 'false'},"
+                f"nuv={len(p.upvalues)},"
+                f"ms={p.max_stacksize},"
+                f"sp={{{sp_str}}}}}"
+            )
         return '\n'.join(lines)
 
-    def _build_handlers(self, v: Dict[str, str], ops: OpcodeMap) -> List[dict]:
-        """Build all opcode handler dicts with value and body."""
-        handlers = []
-        p = v['push_fn']
-        pp = v['pop_fn']
-        ip = v['ip']
-        bc = v['bytecode']
-        sp = v['sp']
-        stk = v['stack']
-        loc = v['locals_tbl']
-        cst = v['constants']
+    # =================================================================
+    # Exec function (the heart of the VM)
+    # =================================================================
 
-        def h(op_name, body):
-            val = ops.get(op_name)
-            handlers.append({'value': val, 'body': body})
+    def _gen_exec_function(self, n: Dict[str, str]) -> str:
+        """Generate the main `exec` interpreter function."""
+        # Build all opcode handler bodies
+        handlers = self._build_handlers(n)
+        # Shuffle for polymorphism
+        self.rng.shuffle(handlers)
 
-        # Stack operations
-        h('PUSH_CONST', f"local _idx={bc}[{ip}];{ip}={ip}+1;{p}({cst}[_idx+1])")
-        h('PUSH_LOCAL', f"local _sl={bc}[{ip}];{ip}={ip}+1;{p}({loc}[_sl])")
-        h('SET_LOCAL', f"local _sl={bc}[{ip}];{ip}={ip}+1;{loc}[_sl]={pp}()")
-        h('PUSH_NIL', f"{p}(nil)")
-        h('PUSH_TRUE', f"{p}(true)")
-        h('PUSH_FALSE', f"{p}(false)")
-        h('POP', f"{sp}={sp}-1")
+        # Build the if/elseif chain
+        chain_lines: List[str] = []
+        for i, h in enumerate(handlers):
+            kw = 'if' if i == 0 else 'elseif'
+            body = h['body']
+            if body.startswith(';'):
+                body = body[1:]
+            chain_lines.append(f"{kw} {n['op']}=={h['byte']} then {body}")
+        chain_lines.append("else error(\"VM: bad opcode \"..tostring(" + n['op'] + "))")
+        chain_lines.append("end")
+        chain = '\n'.join(chain_lines)
 
-        # Arithmetic
-        h('ADD', f"local _b={pp}();local _a={pp}();{p}(_a+_b)")
-        h('SUB', f"local _b={pp}();local _a={pp}();{p}(_a-_b)")
-        h('MUL', f"local _b={pp}();local _a={pp}();{p}(_a*_b)")
-        h('DIV', f"local _b={pp}();local _a={pp}();{p}(_a/_b)")
-        h('MOD', f"local _b={pp}();local _a={pp}();{p}(_a%_b)")
-        h('POW', f"local _b={pp}();local _a={pp}();{p}(_a^_b)")
-        h('UNM', f"{stk}[{sp}]=-{stk}[{sp}]")
-        h('CONCAT', f"local _n={bc}[{ip}];{ip}={ip}+1;local _parts={{}};for _ci=1,_n do _parts[_n-_ci+1]={pp}() end;{p}(table.concat(_parts))")
+        # The exec function
+        # Reads operand bytes; pc is byte-offset (1-based for Lua array indexing).
+        # All u16 operands are little-endian (lo, hi).
+        # Signed sBx is biased by 0x8000 (32768) at encode time.
+        return f"""local {n['exec']}
+{n['exec']}=function({n['proto']},{n['upvals']},...)
+local {n['varargs']}={{...}}
+local {n['nargs']}=select("#",...)
+local {n['R']}={{}}
+for {n['i']}=1,{n['proto']}.np do {n['R']}[{n['i']}-1]={n['varargs']}[{n['i']}] end
+local {n['bc']}={n['proto']}.bc
+local {n['sp']}={n['proto']}.sp
+local {n['pc']}=1
+local {n['top']}={n['proto']}.np
+local {n['box']}
+while true do
+local {n['op']}={n['bxor']}({n['bc']}[{n['pc']}],{n['bk']}[({n['pc']}-1)%{n['bkn']}+1]); {n['pc']}={n['pc']}+1
+{chain}
+end
+end"""
 
-        # Comparison
-        h('EQ', f"local _b={pp}();local _a={pp}();{p}(_a==_b)")
-        h('LT', f"local _b={pp}();local _a={pp}();{p}(_a<_b)")
-        h('LE', f"local _b={pp}();local _a={pp}();{p}(_a<=_b)")
-        h('NOT', f"{stk}[{sp}]=not {stk}[{sp}]")
-        h('LEN', f"{stk}[{sp}]=#({stk}[{sp}])")
+    # =================================================================
+    # Handler construction
+    # =================================================================
 
-        # Control flow
-        h('JMP', f"local _off={bc}[{ip}]+{bc}[{ip}+1]*256;{ip}={ip}+2;if _off>32767 then _off=_off-65536 end;{ip}={ip}+_off")
-        h('JMP_FALSE', f"local _off={bc}[{ip}]+{bc}[{ip}+1]*256;{ip}={ip}+2;if not {stk}[{sp}] then {sp}={sp}-1;if _off>32767 then _off=_off-65536 end;{ip}={ip}+_off else {sp}={sp}-1 end")
-        h('JMP_TRUE', f"local _off={bc}[{ip}]+{bc}[{ip}+1]*256;{ip}={ip}+2;if {stk}[{sp}] then {sp}={sp}-1;if _off>32767 then _off=_off-65536 end;{ip}={ip}+_off else {sp}={sp}-1 end")
+    def _build_handlers(self, n: Dict[str, str]) -> List[dict]:
+        """Build one handler dict per opcode alias byte."""
+        handlers: List[dict] = []
 
-        # Functions — use unpack (Luau) not table.unpack
-        h('CALL', f"local _ac={bc}[{ip}];{ip}={ip}+1;local _rc={bc}[{ip}];{ip}={ip}+1;local _ar={{}};for _ci=_ac,1,-1 do _ar[_ci]={pp}() end;local _fn={pp}();local _rt={{_fn(unpack(_ar))}};for _ci=1,math.min(_rc,#_rt) do {p}(_rt[_ci]) end")
-        h('RETURN', f"local _cnt={bc}[{ip}];{ip}={ip}+1;local _rt={{}};for _ci=_cnt,1,-1 do _rt[_ci]={pp}() end;return unpack(_rt)")
-
-        # Globals and Environment
-        h('GET_GLOBAL', f"local _idx={bc}[{ip}];{ip}={ip}+1;local _nm={cst}[_idx+1];{p}(({v['env']})[_nm] or getfenv()[_nm])")
-        h('SET_GLOBAL', f"local _idx={bc}[{ip}];{ip}={ip}+1;local _nm={cst}[_idx+1];local _val={pp}();({v['env']})[_nm]=_val;if ({v['env']})[_nm]==nil then getfenv()[_nm]=_val end")
-
-        # Tables
-        h('NEW_TABLE', f"local _arr={bc}[{ip}];{ip}={ip}+1;local _hash={bc}[{ip}];{ip}={ip}+1;{p}({{}})")
-        h('GET_TABLE', f"local _key={pp}();local _tbl={pp}();{p}(_tbl[_key])")
-        h('SET_TABLE', f"local _key={pp}();local _tbl={pp}();local _val={pp}();_tbl[_key]=_val")
-        h('SET_LIST', f"local _start={bc}[{ip}];{ip}={ip}+1;local _cnt={bc}[{ip}];{ip}={ip}+1;local _tbl={stk}[{sp}];for _ci=1,_cnt do _tbl[_start+_ci-1]={pp}() end")
-
-        # Closure
-        h('CLOSURE', f"local _idx={bc}[{ip}];{ip}={ip}+1;local _proto={v['proto_tbl']}[_idx+1];{p}(function(...) return {v['vm_func']}(_proto,{v['constants']},{v['env']},{v['proto_tbl']},{{...}}) end)")
-
-        # Vararg
-        h('VARARG', f"local _cnt={bc}[{ip}];{ip}={ip}+1;{p}(nil)")
-
-        # Special
-        h('MOVE', f"local _dest={bc}[{ip}];{ip}={ip}+1;local _src={bc}[{ip}];{ip}={ip}+1;{loc}[_dest]={loc}[_src]")
-        h('DUP', f"{p}({stk}[{sp}])")
-        h('SWAP', f"local _a={pp}();local _b={pp}();{p}(_a);{p}(_b)")
-
-        # NOP
-        h('NOP', "--[[ nop ]]")
+        # Read each alias and its semantic name
+        for byte, info in self.opcodes.all_aliases():
+            body = self._gen_handler_body(info.name, info.fmt, n)
+            handlers.append({'byte': byte, 'body': body, 'name': info.name})
 
         return handlers
+
+    # ---- Operand-reading code generator ----
+
+    def _read_u16_inline(self, n: Dict[str, str], dest: str) -> str:
+        """Generate inline code to read a u16 from BC at PC, advancing PC."""
+        bx, bc, bk, bkn, pc = n['bxor'], n['bc'], n['bk'], n['bkn'], n['pc']
+        return (
+            f"local {dest}={bx}({bc}[{pc}],{bk}[({pc}-1)%{bkn}+1])"
+            f"+{bx}({bc}[{pc}+1],{bk}[{pc}%{bkn}+1])*256;"
+            f"{pc}={pc}+2"
+        )
+
+    def _read_s16_inline(self, n: Dict[str, str], dest: str) -> str:
+        """Generate inline code to read an s16 (biased by 0x8000)."""
+        bx, bc, bk, bkn, pc = n['bxor'], n['bc'], n['bk'], n['bkn'], n['pc']
+        return (
+            f"local {dest}={bx}({bc}[{pc}],{bk}[({pc}-1)%{bkn}+1])"
+            f"+{bx}({bc}[{pc}+1],{bk}[{pc}%{bkn}+1])*256-32768;"
+            f"{pc}={pc}+2"
+        )
+
+    def _read_operands(self, fmt: str, n: Dict[str, str]) -> str:
+        """Generate operand-reading code based on the instruction format.
+        Sets locals named `a`, `b`, `c` based on what the format provides.
+        """
+        a_name, b_name, c_name = n['a'], n['b'], n['c']
+        if fmt == FORMAT_NONE:
+            return ""
+        if fmt == FORMAT_A:
+            return self._read_u16_inline(n, a_name)
+        if fmt == FORMAT_SBX:
+            return self._read_s16_inline(n, a_name)
+        if fmt == FORMAT_AB:
+            return self._read_u16_inline(n, a_name) + ";" + self._read_u16_inline(n, b_name)
+        if fmt == FORMAT_ABC:
+            return (self._read_u16_inline(n, a_name) + ";" +
+                    self._read_u16_inline(n, b_name) + ";" +
+                    self._read_u16_inline(n, c_name))
+        if fmt == FORMAT_ABX:
+            return self._read_u16_inline(n, a_name) + ";" + self._read_u16_inline(n, b_name)
+        if fmt == FORMAT_ASBX:
+            return self._read_u16_inline(n, a_name) + ";" + self._read_s16_inline(n, b_name)
+        raise ValueError(f"Unknown format: {fmt}")
+
+    # ---- Per-opcode handler bodies ----
+
+    def _gen_handler_body(self, op_name: str, fmt: str, n: Dict[str, str]) -> str:
+        ops = self._read_operands(fmt, n)
+        a, b, c = n['a'], n['b'], n['c']
+        R = n['R']
+        CONSTS = n['consts']
+        UPVALS = n['upvals']
+        ENV = n['env']
+        EXEC = n['exec']
+        SP = n['sp']
+        PROTOS = n['protos']
+        UNPACK = n['unpack']
+        BC = n['bc']
+        BK = n['bk']
+        BKN = n['bkn']
+        BXOR = n['bxor']
+        PC = n['pc']
+        VA = n['varargs']
+        NARGS = n['nargs']
+        TOP = n['top']
+        OPSIZE = n['opsize']
+        ISMOVE = n['ismove']
+
+        if op_name == 'MOVE':
+            return ops + f";{R}[{a}]={R}[{b}]"
+        if op_name == 'LOADK':
+            return ops + f";{R}[{a}]={CONSTS}[{b}+1]"
+        if op_name == 'LOADBOOL':
+            # If C != 0, skip the next instruction (size depends on its fmt)
+            return (ops + f";{R}[{a}]=({b}~=0);"
+                    f"if {c}~=0 then "
+                    # Skip next instruction: read its opcode, look up size, advance.
+                    f"local _no={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]);"
+                    f"{PC}={PC}+1+{OPSIZE}[_no] "
+                    f"end")
+        if op_name == 'LOADNIL':
+            # R[A..A+B] := nil
+            return ops + f";for _i={a},{a}+{b} do {R}[_i]=nil end"
+
+        if op_name == 'GETUPVAL':
+            # Unwrap box
+            return ops + f";{R}[{a}]={UPVALS}[{b}+1][1]"
+        if op_name == 'SETUPVAL':
+            return ops + f";{UPVALS}[{b}+1][1]={R}[{a}]"
+
+        if op_name == 'GETGLOBAL':
+            return ops + f";{R}[{a}]={ENV}[{CONSTS}[{b}+1]]"
+        if op_name == 'SETGLOBAL':
+            return ops + f";{ENV}[{CONSTS}[{b}+1]]={R}[{a}]"
+
+        if op_name == 'NEWTABLE':
+            return ops + f";{R}[{a}]={{}}"
+        if op_name == 'GETTABLE':
+            return ops + f";{R}[{a}]={R}[{b}][{R}[{c}]]"
+        if op_name == 'SETTABLE':
+            return ops + f";{R}[{a}][{R}[{b}]]={R}[{c}]"
+        if op_name == 'GETTABLEK':
+            return ops + f";{R}[{a}]={R}[{b}][{CONSTS}[{c}+1]]"
+        if op_name == 'SETTABLEK':
+            return ops + f";{R}[{a}][{CONSTS}[{b}+1]]={R}[{c}]"
+        if op_name == 'SELF':
+            return ops + (f";{R}[{a}+1]={R}[{b}];"
+                          f"{R}[{a}]={R}[{b}][{CONSTS}[{c}+1]]")
+        if op_name == 'SETLIST':
+            # B = count (0 = MULTRET via top), C = block index (1-based)
+            FPF = 50
+            return ops + (
+                f";local _t={R}[{a}];"
+                f"local _off=({c}-1)*{FPF};"
+                f"local _cnt=({b}==0) and ({TOP}-{a}-1) or {b};"
+                f"for _i=1,_cnt do _t[_off+_i]={R}[{a}+_i] end"
+            )
+
+        if op_name == 'ADD':
+            return ops + f";{R}[{a}]={R}[{b}]+{R}[{c}]"
+        if op_name == 'SUB':
+            return ops + f";{R}[{a}]={R}[{b}]-{R}[{c}]"
+        if op_name == 'MUL':
+            return ops + f";{R}[{a}]={R}[{b}]*{R}[{c}]"
+        if op_name == 'DIV':
+            return ops + f";{R}[{a}]={R}[{b}]/{R}[{c}]"
+        if op_name == 'MOD':
+            return ops + f";{R}[{a}]={R}[{b}]%{R}[{c}]"
+        if op_name == 'POW':
+            return ops + f";{R}[{a}]={R}[{b}]^{R}[{c}]"
+        if op_name == 'UNM':
+            return ops + f";{R}[{a}]=-{R}[{b}]"
+        if op_name == 'NOT':
+            return ops + f";{R}[{a}]=not {R}[{b}]"
+        if op_name == 'LEN':
+            return ops + f";{R}[{a}]=#({R}[{b}])"
+        if op_name == 'CONCAT':
+            return ops + (
+                f";local _s={R}[{b}];"
+                f"for _i={b}+1,{c} do _s=_s..{R}[_i] end;"
+                f"{R}[{a}]=_s"
+            )
+
+        if op_name == 'EQ':
+            # Compiler emits cmp + JMP true-skip pattern. Semantics:
+            #   if (R[B]==R[C]) ~= A then pc++ (skip the JMP)
+            return ops + (
+                f";if ({R}[{b}]=={R}[{c}])~=({a}~=0) then "
+                f"local _no={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]);"
+                f"{PC}={PC}+1+{OPSIZE}[_no] "
+                f"end"
+            )
+        if op_name == 'LT':
+            return ops + (
+                f";if ({R}[{b}]<{R}[{c}])~=({a}~=0) then "
+                f"local _no={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]);"
+                f"{PC}={PC}+1+{OPSIZE}[_no] "
+                f"end"
+            )
+        if op_name == 'LE':
+            return ops + (
+                f";if ({R}[{b}]<={R}[{c}])~=({a}~=0) then "
+                f"local _no={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]);"
+                f"{PC}={PC}+1+{OPSIZE}[_no] "
+                f"end"
+            )
+        if op_name == 'TEST':
+            # if not (R[A] <=> B) then pc++ (skip next, usually a JMP)
+            # B==1 -> want truthy; B==0 -> want falsy
+            return ops + (
+                f";local _v={R}[{a}];"
+                f"local _t=(_v~=nil and _v~=false);"
+                f"if _t~=({b}~=0) then "
+                f"local _no={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]);"
+                f"{PC}={PC}+1+{OPSIZE}[_no] "
+                f"end"
+            )
+        if op_name == 'TESTSET':
+            return ops + (
+                f";local _v={R}[{b}];"
+                f"local _t=(_v~=nil and _v~=false);"
+                f"if _t==({c}~=0) then {R}[{a}]=_v else "
+                f"local _no={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]);"
+                f"{PC}={PC}+1+{OPSIZE}[_no] "
+                f"end"
+            )
+
+        if op_name == 'JMP':
+            # sBx in `a`
+            return ops + f";{PC}={PC}+{a}"
+
+        if op_name == 'CALL':
+            # CALL A B C: A=func reg, B=nargs+1 (0=MULTRET), C=nresults+1 (0=MULTRET)
+            return ops + (
+                f";local _f={R}[{a}];"
+                f"local _nargs;"
+                f"if {b}==0 then _nargs={TOP}-{a}-1 else _nargs={b}-1 end;"
+                f"local _ar={{}};"
+                f"for _i=1,_nargs do _ar[_i]={R}[{a}+_i] end;"
+                f"local _rt={{_f({UNPACK}(_ar,1,_nargs))}};"
+                f"local _rn=#_rt;"
+                f"if {c}==0 then "
+                f"for _i=1,_rn do {R}[{a}+_i-1]=_rt[_i] end;"
+                f"{TOP}={a}+_rn "
+                f"else "
+                f"local _want={c}-1;"
+                f"for _i=1,_want do {R}[{a}+_i-1]=_rt[_i] end "
+                f"end"
+            )
+        if op_name == 'TAILCALL':
+            # Same as CALL with MULTRET; not optimized in our VM
+            return ops + (
+                f";local _f={R}[{a}];"
+                f"local _nargs;"
+                f"if {b}==0 then _nargs={TOP}-{a}-1 else _nargs={b}-1 end;"
+                f"local _ar={{}};"
+                f"for _i=1,_nargs do _ar[_i]={R}[{a}+_i] end;"
+                f"return _f({UNPACK}(_ar,1,_nargs))"
+            )
+        if op_name == 'RETURN':
+            # B == 0 -> return all from A to TOP
+            # B == 1 -> return 0 values
+            # else  -> return B-1 values from A
+            return ops + (
+                f";if {b}==0 then "
+                f"local _rt={{}};for _i={a},{TOP}-1 do _rt[_i-{a}+1]={R}[_i] end;"
+                f"return {UNPACK}(_rt,1,{TOP}-{a}) "
+                f"elseif {b}==1 then return "
+                f"else "
+                f"local _rt={{}};for _i=1,{b}-1 do _rt[_i]={R}[{a}+_i-1] end;"
+                f"return {UNPACK}(_rt,1,{b}-1) "
+                f"end"
+            )
+
+        if op_name == 'FORPREP':
+            # R[A] -= R[A+2] ; pc += sBx
+            return ops + (
+                f";{R}[{a}]={R}[{a}]-{R}[{a}+2];"
+                f"{PC}={PC}+{b}"
+            )
+        if op_name == 'FORLOOP':
+            # R[A] += R[A+2]; if (step>0 and i<=stop) or (step<0 and i>=stop) then
+            #   R[A+3] = R[A]; pc += sBx
+            return ops + (
+                f";{R}[{a}]={R}[{a}]+{R}[{a}+2];"
+                f"local _stp={R}[{a}+2];"
+                f"local _i={R}[{a}];"
+                f"local _stop={R}[{a}+1];"
+                f"if (_stp>=0 and _i<=_stop) or (_stp<0 and _i>=_stop) then "
+                f"{R}[{a}+3]=_i;{PC}={PC}+{b} "
+                f"end"
+            )
+        if op_name == 'TFORLOOP':
+            # B = sBx back-jump offset to body start, C = number of vars
+            return ops + (
+                f";local _f={R}[{a}];local _s={R}[{a}+1];local _v={R}[{a}+2];"
+                f"local _rt={{_f(_s,_v)}};"
+                f"if _rt[1]~=nil then "
+                f"{R}[{a}+2]=_rt[1];"
+                f"for _i=1,{c} do {R}[{a}+2+_i]=_rt[_i] end;"
+                f"{PC}={PC}+{b} "
+                f"end"
+            )
+
+        if op_name == 'CLOSURE':
+            # Read N pseudo-instructions for upvalue links
+            return ops + (
+                f";local _np={SP}[{b}+1];"
+                f"local _newp={PROTOS}[_np];"
+                f"local _nuv=_newp.nuv;"
+                f"local _newuv={{}};"
+                f"for _i=1,_nuv do "
+                f"local _po={BXOR}({BC}[{PC}],{BK}[({PC}-1)%{BKN}+1]); {PC}={PC}+1;"
+                f"{self._read_u16_inline(n, '_pa')};"
+                f"{self._read_u16_inline(n, '_pb')};"
+                # Either MOVE or GETUPVAL (any alias).
+                # If it's any MOVE alias, capture local register (a box).
+                # If it's any GETUPVAL alias, share parent's upvalue.
+                f"if {ISMOVE}[_po] then _newuv[_i]={R}[_pb] "
+                f"else _newuv[_i]={UPVALS}[_pb+1] end "
+                f"end;"
+                f"local _np2=_newp;"
+                f"{R}[{a}]=function(...) return {EXEC}(_np2,_newuv,...) end"
+            )
+        if op_name == 'VARARG':
+            # B == 0 -> all-to-top; else B-1 values
+            return ops + (
+                f";if {b}==0 then "
+                f"local _van={NARGS}-{n['proto']}.np;"
+                f"if _van<0 then _van=0 end;"
+                f"for _i=1,_van do {R}[{a}+_i-1]={VA}[{n['proto']}.np+_i] end;"
+                f"{TOP}={a}+_van "
+                f"else "
+                f"local _want={b}-1;"
+                f"for _i=1,_want do {R}[{a}+_i-1]={VA}[{n['proto']}.np+_i] end "
+                f"end"
+            )
+
+        if op_name == 'MKBOX':
+            return ops + f";{R}[{a}]={{{R}[{b}]}}"
+        if op_name == 'GETBOX':
+            return ops + f";{R}[{a}]={R}[{b}][1]"
+        if op_name == 'SETBOX':
+            return ops + f";{R}[{a}][1]={R}[{b}]"
+
+        if op_name == 'NOP':
+            return ops + ";--[[nop]]"
+
+        raise NotImplementedError(f"Handler for {op_name} not implemented")
+
+    # =================================================================
+    # Entry point and helpers
+    # =================================================================
+
+    def _gen_lookup_tables(self, n: Dict[str, str]) -> str:
+        """Lookup tables used by exec for skipping instructions and CLOSURE links."""
+        # opsize: opcode-byte -> operand-block size (excludes opcode byte)
+        size_entries = [
+            f"[{byte}]={instruction_size(info.fmt) - 1}"
+            for byte, info in self.opcodes.all_aliases()
+        ]
+        # ismove: opcode-byte -> true iff it's any MOVE alias
+        move_aliases = self.opcodes.opcodes['MOVE'].aliases
+        ismove_entries = ','.join(f"[{v}]=true" for v in move_aliases)
+        return (
+            f"local {n['opsize']}={{{','.join(size_entries)}}}\n"
+            f"local {n['ismove']}={{{ismove_entries}}}"
+        )
+
+    def _gen_entry(self, n: Dict[str, str]) -> str:
+        return f"return {n['exec']}({n['protos']}[1],{{}},...)"

@@ -16,7 +16,7 @@
 ---
 
 > [!IMPORTANT]
-> Obscura is a research project exploring the limits of Luau bytecode virtualization and control-flow protection. Use responsibly and only on code you own or have permission to protect.
+> Obscura is a research and portfolio project exploring Luau bytecode virtualization, control-flow protection, and source transformation techniques for educational purposes. Use responsibly and only on code you own or have permission to protect.
 
 ---
 
