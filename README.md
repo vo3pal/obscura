@@ -1,16 +1,8 @@
-# 🌑 Obscura
+# Obscura
 
 <div align="center">
 
-```
-   ___  _
-  / _ \| |__  ___  ___ _   _ _ __ __ _
- | | | | '_ \/ __|/ __| | | | '__/ _` |
- | |_| | |_) \__ \ (__| |_| | | | (_| |
-  \___/|_.__/|___/\___|\__,_|_|  \__,_|
-```
-
-**Advanced Luau Obfuscation Engine for Roblox Studio**
+**Luau Obfuscation Engine for Roblox Studio**
 
 *9 independent protection layers. Custom register-based VM. Per-build randomized opcode mapping. Zero plaintext output.*
 
@@ -430,80 +422,6 @@ Captured locals are **boxed** via `MKBOX`/`GETBOX`/`SETBOX` instructions so muta
 
 ---
 
-## 🏗️ Architecture
-
-```
-obscura/
-├── main.py                  # CLI entry point (click-based)
-├── obfuscator.py            # Pipeline orchestrator
-├── config.py                # ObfuscationConfig dataclass + level presets
-│
-├── parser/
-│   ├── lexer.py             # Full Luau tokenizer
-│   ├── parser.py            # Recursive-descent parser → AST
-│   ├── ast_nodes.py         # All AST node dataclasses
-│   ├── emitter.py           # AST → Luau source emitter (minified)
-│   └── scope.py             # Scope tree + variable tracking
-│
-├── layers/
-│   ├── identifier.py        # Layer 1: Identifier renaming
-│   ├── strings.py           # Layer 2: String encryption
-│   ├── numbers.py           # Layer 3: MBA number obfuscation
-│   ├── cff.py               # Layer 4: Control flow flattening
-│   ├── predicates.py        # Layer 5: Opaque predicates
-│   ├── deadcode.py          # Layer 6: Dead code injection
-│   ├── indirection.py       # Layer 7: Table indirection
-│   ├── antitamper.py        # Layer 8: Anti-tamper injection
-│   └── vm/
-│       ├── opcodes.py       # 30+ opcode definitions + randomized byte mapping
-│       ├── constant_pool.py # Constant deduplication + XOR encryption
-│       ├── instruction.py   # Instruction encoding (multi-format: ABC, ABX, ASBX, SBX)
-│       ├── proto.py         # FunctionPrototype + UpvalueDesc dataclasses
-│       ├── compiler.py      # AST → register-based bytecode compiler
-│       └── interpreter.py   # Polymorphic Luau VM stub generator
-│
-└── utils/
-    ├── names.py             # Obfuscated name generator (3 strategies)
-    ├── crypto.py            # XOR encryption, Base64, MBA expression builder
-    └── globals.py           # Roblox/Luau globals whitelist (never renamed)
-```
-
-<details>
-<summary><strong>Pipeline execution order</strong></summary>
-
-**Standard mode (layers 1–8):**
-
-```
-Source
-  → strip_types()       # Remove Luau type annotations
-  → strip_comments()    # Remove all comments
-  → Parser → AST
-  → Layer 4: CFF        # Runs before identifier renaming (hoists locals)
-  → Layer 5: Predicates
-  → Layer 6: Dead Code
-  → Layer 3: Numbers    # MBA after structure is established
-  → Layer 2: Strings    # Injects encrypted decoder header
-  → Layer 1: Identifiers # Renames everything including injected names
-  → Layer 7: Indirection # Wraps globals post-rename
-  → Layer 8: Anti-Tamper # Wraps entire block in IIFE
-  → Emitter → minified single-line output
-```
-
-**VM mode (layer 9):**
-
-```
-Source
-  → strip_types() + strip_comments()
-  → Parser → AST
-  → VMCompiler → FunctionPrototype tree (bytecode + constant pool)
-  → InterpreterGenerator → polymorphic Luau VM stub
-  → IIFE wrap → minified single-line output
-```
-
-</details>
-
----
-
 ## 🔍 How Each Layer Works
 
 <details>
@@ -693,4 +611,4 @@ Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for full text.
 
 ## ⚠️ Disclaimer
 
-Obscura is a **research and portfolio project** built for educational exploration of compiler design, bytecode virtualization, and program transformation. It is not affiliated with or endorsed by Roblox Corporation. The authors are not responsible for misuse. Do not use this tool on code you do not own or do not have explicit permission to obfuscate.
+Obscura is a **research and portfolio project** built for educational exploration of compiler design, bytecode virtualization, and program transformation. It is not affiliated with or endorsed by Roblox Corporation. I wont be held responsible for any misuse.
