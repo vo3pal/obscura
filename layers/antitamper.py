@@ -19,6 +19,9 @@ class AntiTamperInjector:
         self.rng = config.get_rng()
         self.name_gen = NameGenerator(rng=self.rng, min_length=8, max_length=12)
 
+    def _char_expr(self, value: str) -> Identifier:
+        return Identifier(name='string.char(' + ','.join(str(ord(ch)) for ch in value) + ')')
+
     def apply(self, block: Block) -> Block:
         """Apply anti-tamper protections to the AST."""
         guards = []
@@ -66,7 +69,7 @@ class AntiTamperInjector:
                 # Use a standard error instead of an infinite hang
                 ExpressionStatement(expression=FunctionCall(
                     func=Identifier(name='error'),
-                    args=[StringLiteral(value='Execution denied')]
+                    args=[StringLiteral(value='')]
                 ))
             ]),
             elseif_clauses=[],
@@ -87,7 +90,7 @@ class AntiTamperInjector:
                                 MethodCall(
                                     object=Identifier(name='game'),
                                     method='GetService',
-                                    args=[StringLiteral(value='RunService')]
+                                    args=[self._char_expr('RunService')]
                                 )
                             ])
                         ])
@@ -130,12 +133,15 @@ class AntiTamperInjector:
                         func=Identifier(name=type_backup),
                         args=[Identifier(name=g)]
                     ),
-                    right=StringLiteral(value='nil')
+                    right=FunctionCall(
+                        func=Identifier(name=type_backup),
+                        args=[NilLiteral()]
+                    )
                 ),
                 body=Block(body=[
                     ExpressionStatement(expression=FunctionCall(
                         func=Identifier(name='error'),
-                        args=[StringLiteral(value='Security violation')]
+                        args=[StringLiteral(value='')]
                     ))
                 ]),
                 elseif_clauses=[],
@@ -151,12 +157,15 @@ class AntiTamperInjector:
                     func=Identifier(name=type_backup),
                     args=[Identifier(name='print')]
                 ),
-                right=StringLiteral(value='function')
+                right=FunctionCall(
+                    func=Identifier(name=type_backup),
+                    args=[FunctionExpr(params=[], body=Block(body=[]))]
+                )
             ),
             body=Block(body=[
                 ExpressionStatement(expression=FunctionCall(
                     func=Identifier(name='error'),
-                    args=[StringLiteral(value='Environment tampered')]
+                    args=[StringLiteral(value='')]
                 ))
             ]),
             elseif_clauses=[],
@@ -197,7 +206,7 @@ class AntiTamperInjector:
                 body=Block(body=[
                     ExpressionStatement(expression=FunctionCall(
                         func=Identifier(name='error'),
-                        args=[StringLiteral(value='Integrity check failed')]
+                        args=[StringLiteral(value='')]
                     ))
                 ]),
                 elseif_clauses=[],
