@@ -2,6 +2,8 @@
 
 A Luau obfuscator for Roblox. Version 1.1.0. Requires Python 3.10 or newer.
 
+**[TRY HERE — obscura.vo3pal.dev](https://obscura.vo3pal.dev/)**
+
 ## Setup
 
 ```sh
