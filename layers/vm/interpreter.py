@@ -155,6 +155,9 @@ class InterpreterGenerator:
             if self.config.vm_operand_layouts:
                 proto.operand_mul = self.rng.randrange(1, 65536, 2)
                 proto.operand_add = self.rng.randrange(65536)
+                proto.operand_opcode_mul = self.rng.randrange(1, 65536, 2)
+                proto.operand_salt = self.rng.randrange(65536)
+                proto.operand_family = self.rng.randrange(3)
             proto.interpreter_index = (self.rng.randint(1, 2)
                                        if self.config.vm_multi_interpreters else 1)
         root_wire_bytecode = self._encode_proto_opcodes(main_proto)
@@ -477,12 +480,13 @@ local {n['bkn']}=#{n['bk']}"""
 
     def _encode_proto_operands(self, proto: FunctionPrototype,
                                bytecode: List[int]) -> List[int]:
-        """Apply a position-dependent 16-bit mask to every operand pair."""
+        """Apply a position- and opcode-dependent mask to every operand pair."""
         if not self.config.vm_operand_layouts:
             return bytecode
         out = list(bytecode)
         for instruction in proto.instructions:
             info = self.opcodes.get(instruction.op_name)
+            opcode = proto.bytecode[instruction.pc]
             count = operand_count(instruction.fmt)
             for slot in range(count):
                 position = instruction.pc + 1 + slot * 2
@@ -491,8 +495,7 @@ local {n['bkn']}=#{n['bk']}"""
                     value = first + second * 256
                 else:
                     value = second + first * 256
-                mask = (((position + 1) * proto.operand_mul
-                         + proto.operand_add) % 65536)
+                mask = self._operand_mask_value(proto, position + 1, opcode)
                 value ^= mask
                 low, high = value % 256, value // 256
                 if info.byte_order == 'little':
@@ -500,6 +503,22 @@ local {n['bkn']}=#{n['bk']}"""
                 else:
                     out[position], out[position + 1] = high, low
         return out
+
+    @staticmethod
+    def _operand_mask_value(proto: FunctionPrototype, position: int,
+                            opcode: int) -> int:
+        """Mirror the generated Luau operand-mask families exactly."""
+        base = (position * proto.operand_mul + proto.operand_add) % 65536
+        keyed_opcode = (opcode * proto.operand_opcode_mul
+                        + proto.operand_salt) % 65536
+        if proto.operand_family == 1:
+            return base ^ keyed_opcode
+        if proto.operand_family == 2:
+            return (((position + opcode + 1) * proto.operand_mul
+                     + proto.operand_add
+                     + ((position * opcode) % 65536) * proto.operand_opcode_mul
+                     + proto.operand_salt) % 65536)
+        return (base + keyed_opcode) % 65536
 
     def _hash_bytes(self, data: List[int]) -> int:
         h = self.hash_seed
@@ -540,7 +559,9 @@ local {n['bkn']}=#{n['bk']}"""
                           p.fetch_seed ^ p.fetch_share,p.fetch_mul,p.fetch_add,
                           p.fetch_step,p.fetch_byte,p.fetch_bias,p.fetch_tag_seed,
                           p.fetch_tag_mul,p.fetch_family,p.proto_link_mul,
-                          p.proto_link_add,p.operand_mul,p.operand_add,len(wire_sp)):
+                          p.proto_link_add,p.operand_mul,p.operand_add,
+                          p.operand_opcode_mul,p.operand_salt,p.operand_family,
+                          len(wire_sp)):
                 digest.uint(value)
             for index in wire_sp:
                 digest.uint(index)
@@ -570,6 +591,8 @@ local {n['bkn']}=#{n['bk']}"""
                            f"ftm={p.fetch_tag_mul},ff={p.fetch_family},"
                            f"lm={p.proto_link_mul},la={p.proto_link_add},"
                            f"xm={p.operand_mul},xa={p.operand_add},"
+                           f"xo={p.operand_opcode_mul},xs={p.operand_salt},"
+                           f"xf={p.operand_family},"
                            f"fp={{{positions}}},fl={{{lengths}}},"
                            f"ft={{{tags}}},fx={{{lookup}}}")
             lines.append(
@@ -656,6 +679,7 @@ _h={u}(_h,_p.ix)
 _h={u}(_h,_p.f1);_h={u}(_h,_p.f2);_h={u}(_h,_p.fm);_h={u}(_h,_p.fa)
 _h={u}(_h,_p.fq);_h={u}(_h,_p.fw);_h={u}(_h,_p.fb);_h={u}(_h,_p.fts);_h={u}(_h,_p.ftm);_h={u}(_h,_p.ff)
 _h={u}(_h,_p.lm);_h={u}(_h,_p.la);_h={u}(_h,_p.xm);_h={u}(_h,_p.xa)
+_h={u}(_h,_p.xo);_h={u}(_h,_p.xs);_h={u}(_h,_p.xf)
 _h={u}(_h,#_p.sp);for _i=1,#_p.sp do _h={u}(_h,_p.sp[_i]) end
 _h={blob}(_h,_p.fp);_h={blob}(_h,_p.fl);_h={blob}(_h,_p.ft)
 for _i=1,#_p.fp do if _p.fx[_p.fp[_i]]~=_i then return -1 end end
@@ -916,7 +940,7 @@ end"""
             low,high = (position,position+'+1') if info.byte_order=='little' else (position+'+1',position)
             expression = f"{self._byte_expr(n,low)}+256*{self._byte_expr(n,high)}"
             if self.config.vm_operand_layouts:
-                expression = f"{n['bxor']}({expression},(({position})*{n['proto']}.xm+{n['proto']}.xa)%65536)"
+                expression = f"{n['bxor']}({expression},{self._operand_mask_expr(n, position, n['op'])})"
             reads.append(f'local {operands[index]}={expression}')
         reads.append(f"{n['pc']}={n['pc']}+{len(operands)*2}")
         bodies = []
@@ -940,7 +964,21 @@ end"""
         keyed = f"{n['bxor']}({n['bc']}[{pos}],{n['bk']}[({pos}-1)%{n['bkn']}+1])"
         return f"{n['bxor']}({keyed},(({pos})*{n['proto']}.bm+{n['proto']}.ba)%256)"
 
-    def _read_u16_inline(self, n: Dict[str, str], dest: str, byte_order='little') -> str:
+    def _operand_mask_expr(self, n: Dict[str, str], position: str,
+                           opcode: str) -> str:
+        """Emit the selected per-prototype operand mask without a shared helper."""
+        proto, bxor = n['proto'], n['bxor']
+        base = f"(({position})*{proto}.xm+{proto}.xa)%65536"
+        keyed = f"(({opcode})*{proto}.xo+{proto}.xs)%65536"
+        family1 = f"{bxor}({base},{keyed})"
+        family2 = (f"((({position})+({opcode})+1)*{proto}.xm+{proto}.xa+"
+                   f"((({position})*({opcode}))%65536)*{proto}.xo+{proto}.xs)%65536")
+        family0 = f"({base}+{keyed})%65536"
+        return (f"({proto}.xf==1 and {family1} or "
+                f"({proto}.xf==2 and {family2} or {family0}))")
+
+    def _read_u16_inline(self, n: Dict[str, str], dest: str,
+                         byte_order='little', opcode=None) -> str:
         """Generate inline code to read a u16 from BC at PC, advancing PC."""
         bx, bc, bk, bkn, pc = n['bxor'], n['bc'], n['bk'], n['bkn'], n['pc']
         lo,hi = (pc,pc+'+1') if byte_order=='little' else (pc+'+1',pc)
@@ -949,13 +987,14 @@ end"""
         if self.config.vm_handler_variants and self.rng.randrange(2):
             expression = f'256*{high}+{low}'
         if self.config.vm_operand_layouts:
-            expression = f"{bx}({expression},({pc}*{n['proto']}.xm+{n['proto']}.xa)%65536)"
+            expression = f"{bx}({expression},{self._operand_mask_expr(n, pc, opcode or n['op'])})"
         return (
             f"local {dest}={expression};"
             f"{pc}={pc}+2"
         )
 
-    def _read_s16_inline(self, n: Dict[str, str], dest: str, byte_order='little') -> str:
+    def _read_s16_inline(self, n: Dict[str, str], dest: str,
+                         byte_order='little', opcode=None) -> str:
         """Generate inline code to read an s16 (biased by 0x8000)."""
         bx, bc, bk, bkn, pc = n['bxor'], n['bc'], n['bk'], n['bkn'], n['pc']
         lo,hi = (pc,pc+'+1') if byte_order=='little' else (pc+'+1',pc)
@@ -964,7 +1003,7 @@ end"""
         if self.config.vm_handler_variants and self.rng.randrange(2):
             expression = f'{high}*256+{low}'
         if self.config.vm_operand_layouts:
-            expression = f"{bx}({expression},({pc}*{n['proto']}.xm+{n['proto']}.xa)%65536)"
+            expression = f"{bx}({expression},{self._operand_mask_expr(n, pc, opcode or n['op'])})"
         expression = f'{expression}-32768'
         return (
             f"local {dest}={expression};"
@@ -1259,8 +1298,8 @@ end"""
                 f"for _i=1,_nuv do {link_reset}"
                 f"local _po={self._byte_expr(n,PC)}; {PC}={PC}+1;"
                 f"_po=(((_po-{n['proto']}.oa)%256)*{n['proto']}.oi)%256;"
-                f"{self._read_u16_inline(n, '_pa')};"
-                f"{self._read_u16_inline(n, '_pb')};"
+                f"{self._read_u16_inline(n, '_pa', opcode='_po')};"
+                f"{self._read_u16_inline(n, '_pb', opcode='_po')};"
                 # Either MOVE or GETUPVAL (any alias).
                 # If it's any MOVE alias, capture local register (a box).
                 # If it's any GETUPVAL alias, share parent's upvalue.

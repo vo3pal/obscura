@@ -218,6 +218,30 @@ return a()+b()+c()+d()'''
                 wire = (opcode * multiplier + offset) % 256
                 self.assertEqual(((wire - offset) % 256 * inverse) % 256, opcode)
 
+    def test_operand_masks_depend_on_opcode_and_family(self):
+        config = ObfuscationConfig(virtualize=True, vm_hardening="max", seed=707)
+        rng = config.get_rng()
+        generator = InterpreterGenerator(
+            config,
+            OpcodeMap(rng, diversify=True, fusion=True, extended=True,
+                      handler_variants=True),
+            ConstantPool(rng), NameGenerator(rng=rng),
+        )
+        proto = FunctionPrototype(
+            operand_mul=31337, operand_add=991,
+            operand_opcode_mul=40503, operand_salt=17011,
+        )
+        masks = set()
+        for family in range(3):
+            proto.operand_family = family
+            family_masks = {
+                generator._operand_mask_value(proto, position, opcode)
+                for position in (2, 7, 31) for opcode in (3, 91, 207)
+            }
+            self.assertGreater(len(family_masks), 3)
+            masks.update((family, value) for value in family_masks)
+        self.assertGreater(len(masks), 20)
+
 
 if __name__ == "__main__":
     unittest.main()

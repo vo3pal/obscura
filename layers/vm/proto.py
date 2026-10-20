@@ -59,6 +59,9 @@ class FunctionPrototype:
     proto_link_add: int = 0
     operand_mul: int = 0
     operand_add: int = 0
+    operand_opcode_mul: int = 0
+    operand_salt: int = 0
+    operand_family: int = 0
     fetch_positions: List[int] = field(default_factory=list)
     fetch_lengths: List[int] = field(default_factory=list)
     fetch_tags: List[int] = field(default_factory=list)
