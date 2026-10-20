@@ -134,7 +134,7 @@ class Obfuscator:
         # Ensure everything after the header is on a single line
         output = output.replace('\n', ' ').replace('\r', ' ')
 
-        # Add build signature comment (exactly 3 lines)
+        # Add the Obscura watermark (exactly 3 lines)
         header = f"--!nocheck\n--!nolint\n-- Obscura [{self.config._build_id}]\n"
         return header + output
 
@@ -176,7 +176,7 @@ class Obfuscator:
         # Ensure everything after the header is on a single line
         final_code = final_code.replace('\n', ' ').replace('\r', ' ')
 
-        # Add build signature and suppress Studio analysis (exactly 3 lines of comments)
+        # Add the Obscura watermark and suppress Studio analysis
         header = f"--!nocheck\n--!nolint\n-- Obscura VM [{self.config._build_id}]\n"
         return header + final_code
 

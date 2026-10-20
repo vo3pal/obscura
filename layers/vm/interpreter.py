@@ -94,7 +94,24 @@ class InterpreterGenerator:
         self.hash_seed = self.rng.randrange(4294967296)
         # Products stay below 2^48, exactly representable in Luau doubles.
         self.hash_multiplier = self.rng.randrange(257, 65536, 2)
+        self.runtime_check_interval = self.rng.randint(3, 9)
+        self.lookup_mul = self.rng.randrange(1, 256, 2)
+        self.lookup_add = self.rng.randrange(256)
+        self.lookup_mask_mul = self.rng.randrange(1, 256, 2)
+        self.lookup_mask_add = self.rng.randrange(256)
         self._key_records = {}
+
+    def _lookup_slot(self, byte: int) -> int:
+        return (byte * self.lookup_mul + self.lookup_add) % 256
+
+    def _lookup_mask(self, slot: int) -> int:
+        return (slot * self.lookup_mask_mul + self.lookup_mask_add) % 256
+
+    def _lookup_slot_expr(self, expression: str) -> str:
+        return f"(({expression})*{self.lookup_mul}+{self.lookup_add})%256"
+
+    def _lookup_mask_expr(self, expression: str) -> str:
+        return f"(({expression})*{self.lookup_mask_mul}+{self.lookup_mask_add})%256"
 
     # =================================================================
     # Public entry
@@ -104,15 +121,53 @@ class InterpreterGenerator:
         names = self._gen_names()
         parts: List[str] = []
         all_protos = self._flatten_protos(main_proto)
-        if self.config.vm_per_proto_keys:
-            for proto in all_protos:
+        for proto in all_protos:
+            if self.config.vm_per_proto_keys:
                 proto.bytecode_key = [self.rng.randint(1,255) for _ in range(self.rng.randint(8,16))]
+            if self.config.vm_position_keys:
+                proto.bytecode_mul = self.rng.randrange(1, 256, 2)
+                proto.bytecode_add = self.rng.randrange(256)
+            else:
+                proto.bytecode_mul = 0
+                proto.bytecode_add = 0
+            if self.config.vm_per_proto_opcodes:
+                proto.opcode_mul = self.rng.randrange(1, 256, 2)
+                proto.opcode_add = self.rng.randrange(256)
+                proto.opcode_inverse = pow(proto.opcode_mul, -1, 256)
+            else:
+                proto.opcode_mul = 1
+                proto.opcode_add = 0
+                proto.opcode_inverse = 1
+            if self.config.vm_stateful_fetch:
+                proto.fetch_seed = self.rng.randrange(65536)
+                proto.fetch_share = self.rng.randrange(65536)
+                proto.fetch_mul = self.rng.randrange(1, 65536, 2)
+                proto.fetch_add = self.rng.randrange(65536)
+                proto.fetch_step = self.rng.randrange(1, 65536, 2)
+                proto.fetch_byte = self.rng.randrange(1, 256, 2)
+                proto.fetch_bias = self.rng.randrange(256)
+                proto.fetch_tag_seed = self.rng.randrange(4294967296)
+                proto.fetch_tag_mul = self.rng.randrange(257, 65536, 2)
+                proto.fetch_family = self.rng.randrange(3)
+            if self.config.vm_shuffle_prototypes:
+                proto.proto_link_mul = self.rng.randrange(1, 65536, 2)
+                proto.proto_link_add = self.rng.randrange(65536)
+            if self.config.vm_operand_layouts:
+                proto.operand_mul = self.rng.randrange(1, 65536, 2)
+                proto.operand_add = self.rng.randrange(65536)
+            proto.interpreter_index = (self.rng.randint(1, 2)
+                                       if self.config.vm_multi_interpreters else 1)
+        root_wire_bytecode = self._encode_proto_opcodes(main_proto)
+        root_wire_bytecode = self._encode_proto_operands(main_proto, root_wire_bytecode)
         self._root_salt = self._hash_bytes(self._encrypt_bytecode(
-            main_proto.bytecode, main_proto.bytecode_key if self.config.vm_per_proto_keys else None))
+            self._stateful_encode(main_proto, root_wire_bytecode),
+            main_proto.bytecode_key if self.config.vm_per_proto_keys else None,
+            main_proto.bytecode_mul, main_proto.bytecode_add))
 
         # 1. Compatibility shims
         parts.append(self._gen_compat_shims(names))
-        if self.config.vm_dynamic_keys or self.config.vm_integrity_check:
+        if (self.config.vm_dynamic_keys or self.config.vm_integrity_check
+                or self.config.vm_runtime_integrity):
             parts.append(self._gen_payload_helpers(names))
 
         # 2. Constant pool key + decode
@@ -167,8 +222,19 @@ class InterpreterGenerator:
         # 5. Lookup tables used by the exec function (must come BEFORE exec).
         parts.append(self._gen_lookup_tables(names))
 
-        # 6. The exec function
-        parts.append(self._gen_exec_function(names))
+        # 6. One or more structurally independent interpreter bodies. Nested
+        # closures call the router, so prototypes can switch engines freely.
+        if self.config.vm_multi_interpreters:
+            parts.append(f"local {names['exec']},{names['exec1']},{names['exec2']}")
+            parts.append(self._gen_exec_function(names, names['exec1']))
+            parts.append(self._gen_exec_function(names, names['exec2']))
+            parts.append(f'''{names['exec']}=function(_p,_u,...)
+if _p.ix==1 then return {names['exec1']}(_p,_u,...)
+else return {names['exec2']}(_p,_u,...) end
+end''')
+        else:
+            parts.append(f"local {names['exec']}")
+            parts.append(self._gen_exec_function(names, names['exec']))
 
         # 7. Entry point
         parts.append(self._gen_entry(names))
@@ -188,7 +254,7 @@ class InterpreterGenerator:
             'bk', 'bkn',
             'protos',
             # Exec function and locals
-            'exec', 'proto', 'upvals', 'varargs',
+            'exec', 'exec1', 'exec2', 'proto', 'upvals', 'varargs',
             'R', 'pc', 'bc', 'sp', 'top', 'op',
             # Operand temps
             'a', 'b', 'c', 'd', 'tmp', 'tmp2', 'tmp3',
@@ -207,6 +273,7 @@ class InterpreterGenerator:
             'hashstep', 'hashuint', 'hashblob', 'hashkey', 'hashvalue',
             'hashpool', 'hashproto', 'salt', 'unkey', 'number',
             'decode',
+            'readbyte', 'resetfetch',
         ]
         out = {}
         for k in keys:
@@ -336,18 +403,103 @@ local {n['bkn']}=#{n['bk']}"""
             return idx
 
         walk(root)
-        # Stash sp_indices as an attribute on each proto for emission
-        for p in flat:
-            p._sp_indices = sp_indices[id(p)]
+        if self.config.vm_shuffle_prototypes and len(flat) > 2:
+            order = list(range(1, len(flat)))
+            self.rng.shuffle(order)
+            order.insert(0, 0)
+            remap = {old: new for new, old in enumerate(order)}
+            flat = [flat[old] for old in order]
+            for p in flat:
+                p._sp_indices = [remap[index] for index in sp_indices[id(p)]]
+        else:
+            for p in flat:
+                p._sp_indices = sp_indices[id(p)]
         return flat
 
-    def _encrypt_bytecode(self, bc: List[int], key=None) -> List[int]:
-        """Apply repeating multi-byte XOR to the byte stream.
+    def _encrypt_bytecode(self, bc: List[int], key=None, multiplier=0, offset=0) -> List[int]:
+        """Apply keyed, position-dependent XOR to the byte stream.
 
-        The runtime decrypts using key index `(pc-1) % klen + 1` (Lua 1-based).
+        The extra affine byte mask prevents a repeating-key pattern while
+        retaining constant-time random access for branches.
         """
         key = self.bc_key if key is None else key
-        return [b ^ key[i % len(key)] for i, b in enumerate(bc)]
+        return [b ^ key[i % len(key)] ^ (((i + 1) * multiplier + offset) % 256)
+                for i, b in enumerate(bc)]
+
+    def _stateful_encode(self, proto: FunctionPrototype, bytecode: List[int]) -> List[int]:
+        """Encode each instruction with a state chained through its clear bytes."""
+        if not self.config.vm_stateful_fetch or self.config.vm_predecode_bytecode:
+            return bytecode
+        out = list(bytecode)
+        proto.fetch_positions = []
+        proto.fetch_lengths = []
+        proto.fetch_tags = []
+        for instruction in proto.instructions:
+            start = instruction.pc
+            state = (proto.fetch_seed + (start + 1) * proto.fetch_mul
+                     + proto.fetch_add) % 65536
+            size = instruction_size(instruction.fmt)
+            tag = (proto.fetch_tag_seed + (start + 1) * proto.fetch_tag_mul) % 4294967296
+            for relative in range(size):
+                position = start + relative
+                clear = bytecode[position]
+                high, low = state // 256, state % 256
+                if proto.fetch_family == 1:
+                    mask = ((high + proto.fetch_byte) % 256) ^ low
+                    state = (state * proto.fetch_step + clear * proto.fetch_byte
+                             + relative + 1 + proto.fetch_bias) % 65536
+                elif proto.fetch_family == 2:
+                    mask = high ^ ((low + proto.fetch_bias) % 256)
+                    state = (state * proto.fetch_step + clear + proto.fetch_bias
+                             + (relative + 1) * proto.fetch_byte) % 65536
+                else:
+                    mask = high ^ low
+                    state = (state * proto.fetch_step + clear
+                             + (relative + 1) * proto.fetch_byte
+                             + proto.fetch_bias) % 65536
+                out[position] = clear ^ mask
+                tag = (tag * proto.fetch_tag_mul + clear
+                       + (relative + 1) * proto.fetch_byte
+                       + proto.fetch_bias) % 4294967296
+            proto.fetch_positions.append(start + 1)
+            proto.fetch_lengths.append(size)
+            proto.fetch_tags.append(tag)
+        return out
+
+    def _encode_proto_opcodes(self, proto: FunctionPrototype) -> List[int]:
+        """Apply a prototype-specific bijection to instruction opcode bytes."""
+        bytecode = list(proto.bytecode)
+        for instruction in proto.instructions:
+            bytecode[instruction.pc] = (
+                bytecode[instruction.pc] * proto.opcode_mul + proto.opcode_add
+            ) % 256
+        return bytecode
+
+    def _encode_proto_operands(self, proto: FunctionPrototype,
+                               bytecode: List[int]) -> List[int]:
+        """Apply a position-dependent 16-bit mask to every operand pair."""
+        if not self.config.vm_operand_layouts:
+            return bytecode
+        out = list(bytecode)
+        for instruction in proto.instructions:
+            info = self.opcodes.get(instruction.op_name)
+            count = operand_count(instruction.fmt)
+            for slot in range(count):
+                position = instruction.pc + 1 + slot * 2
+                first, second = out[position], out[position + 1]
+                if info.byte_order == 'little':
+                    value = first + second * 256
+                else:
+                    value = second + first * 256
+                mask = (((position + 1) * proto.operand_mul
+                         + proto.operand_add) % 65536)
+                value ^= mask
+                low, high = value % 256, value // 256
+                if info.byte_order == 'little':
+                    out[position], out[position + 1] = low, high
+                else:
+                    out[position], out[position + 1] = high, low
+        return out
 
     def _hash_bytes(self, data: List[int]) -> int:
         h = self.hash_seed
@@ -359,10 +511,19 @@ local {n['bkn']}=#{n['bk']}"""
         """Emit the table of all proto data."""
         lines = [f"local {n['protos']}={{}}"]
         for i, p in enumerate(protos):
-            enc_bc = self._encrypt_bytecode(p.bytecode,p.bytecode_key if self.config.vm_per_proto_keys else None)
+            wire_bc = self._encode_proto_opcodes(p)
+            wire_bc = self._encode_proto_operands(p, wire_bc)
+            plain_hash = self._hash_bytes(wire_bc)
+            protected_bc = self._stateful_encode(p, wire_bc)
+            enc_bc = self._encrypt_bytecode(
+                protected_bc, p.bytecode_key if self.config.vm_per_proto_keys else None,
+                p.bytecode_mul, p.bytecode_add)
             bc_str = ','.join(str(b) for b in enc_bc)
-            sp_str = ','.join(str(idx + 1) for idx in p._sp_indices)  # Lua 1-based
+            wire_sp = [(idx + 1) ^ (((j + 1) * p.proto_link_mul + p.proto_link_add) % 65536)
+                       for j, idx in enumerate(p._sp_indices)]
+            sp_str = ','.join(map(str, wire_sp))
             salt = self._hash_bytes(enc_bc)
+            runtime_hash = plain_hash if self.config.vm_predecode_bytecode else salt
             pool_field = ''
             if self.config.vm_partition_constants:
                 pool = p.constant_pool
@@ -373,16 +534,44 @@ local {n['bkn']}=#{n['bk']}"""
             key_field = f",bk={self._gen_key_table(p.bytecode_key,n,salt)}" if self.config.vm_per_proto_keys else ''
             digest = PayloadHash(self.hash_seed,self.hash_multiplier)
             digest.blob(enc_bc)
-            for value in (p.num_params,int(p.is_vararg),len(p.upvalues),p.max_stacksize,len(p._sp_indices)):
+            for value in (p.num_params,int(p.is_vararg),len(p.upvalues),p.max_stacksize,
+                          p.bytecode_mul,p.bytecode_add,p.opcode_mul,p.opcode_add,
+                          p.opcode_inverse,p.interpreter_index,p.fetch_share,
+                          p.fetch_seed ^ p.fetch_share,p.fetch_mul,p.fetch_add,
+                          p.fetch_step,p.fetch_byte,p.fetch_bias,p.fetch_tag_seed,
+                          p.fetch_tag_mul,p.fetch_family,p.proto_link_mul,
+                          p.proto_link_add,p.operand_mul,p.operand_add,len(wire_sp)):
                 digest.uint(value)
-            for index in p._sp_indices:
-                digest.uint(index+1)
+            for index in wire_sp:
+                digest.uint(index)
+            digest.blob(p.fetch_positions)
+            digest.blob(p.fetch_lengths)
+            digest.blob(p.fetch_tags)
+            if self.config.vm_integrity_check:
+                digest.uint(plain_hash)
+                if self.config.vm_runtime_integrity:
+                    digest.uint(runtime_hash)
             if self.config.vm_per_proto_keys:
                 digest.key(self._key_record(p.bytecode_key,salt))
             if self.config.vm_partition_constants:
                 values,kinds = pool.encoded_values(self.config.vm_encode_numbers)
                 digest.pool(values,kinds,self._key_record(pool.key,salt))
-            hash_field = f",ih={digest.value}" if self.config.vm_integrity_check else ''
+            hash_field = (f",ih={digest.value},ph={plain_hash}"
+                          if self.config.vm_integrity_check else '')
+            runtime_field = (f",rh={runtime_hash}"
+                             if self.config.vm_runtime_integrity else '')
+            positions = ','.join(map(str, p.fetch_positions))
+            lengths = ','.join(map(str, p.fetch_lengths))
+            tags = ','.join(map(str, p.fetch_tags))
+            lookup = ','.join(f'[{pc}]={j + 1}' for j, pc in enumerate(p.fetch_positions))
+            fetch_field = (f",f1={p.fetch_share},f2={p.fetch_seed ^ p.fetch_share},"
+                           f"fm={p.fetch_mul},fa={p.fetch_add},fq={p.fetch_step},"
+                           f"fw={p.fetch_byte},fb={p.fetch_bias},fts={p.fetch_tag_seed},"
+                           f"ftm={p.fetch_tag_mul},ff={p.fetch_family},"
+                           f"lm={p.proto_link_mul},la={p.proto_link_add},"
+                           f"xm={p.operand_mul},xa={p.operand_add},"
+                           f"fp={{{positions}}},fl={{{lengths}}},"
+                           f"ft={{{tags}}},fx={{{lookup}}}")
             lines.append(
                 f"{n['protos']}[{i + 1}]="
                 f"{{bc={{{bc_str}}},"
@@ -390,7 +579,13 @@ local {n['bkn']}=#{n['bk']}"""
                 f"va={'true' if p.is_vararg else 'false'},"
                 f"nuv={len(p.upvalues)},"
                 f"ms={p.max_stacksize},"
-                f"sp={{{sp_str}}}{hash_field}{pool_field}{key_field}}}"
+                f"bm={p.bytecode_mul},"
+                f"ba={p.bytecode_add},"
+                f"om={p.opcode_mul},"
+                f"oa={p.opcode_add},"
+                f"oi={p.opcode_inverse},"
+                f"ix={p.interpreter_index},"
+                f"sp={{{sp_str}}}{hash_field}{runtime_field}{pool_field}{key_field}{fetch_field}}}"
             )
         return '\n'.join(lines)
 
@@ -455,7 +650,17 @@ end
 local function {proto}(_p)
 local _h={blob}({self.hash_seed},_p.bc)
 _h={u}(_h,_p.np);_h={u}(_h,_p.va and 1 or 0);_h={u}(_h,_p.nuv);_h={u}(_h,_p.ms)
+_h={u}(_h,_p.bm);_h={u}(_h,_p.ba)
+_h={u}(_h,_p.om);_h={u}(_h,_p.oa);_h={u}(_h,_p.oi)
+_h={u}(_h,_p.ix)
+_h={u}(_h,_p.f1);_h={u}(_h,_p.f2);_h={u}(_h,_p.fm);_h={u}(_h,_p.fa)
+_h={u}(_h,_p.fq);_h={u}(_h,_p.fw);_h={u}(_h,_p.fb);_h={u}(_h,_p.fts);_h={u}(_h,_p.ftm);_h={u}(_h,_p.ff)
+_h={u}(_h,_p.lm);_h={u}(_h,_p.la);_h={u}(_h,_p.xm);_h={u}(_h,_p.xa)
 _h={u}(_h,#_p.sp);for _i=1,#_p.sp do _h={u}(_h,_p.sp[_i]) end
+_h={blob}(_h,_p.fp);_h={blob}(_h,_p.fl);_h={blob}(_h,_p.ft)
+for _i=1,#_p.fp do if _p.fx[_p.fp[_i]]~=_i then return -1 end end
+_h={u}(_h,_p.ph)
+{f"_h={u}(_h,_p.rh)" if self.config.vm_runtime_integrity else ''}
 {f"_h={key}(_h,_p.bk)" if self.config.vm_per_proto_keys else ''}
 {f"_h={pool}(_h,_p.k,_p.pending,_p.kc,_p.ck)" if self.config.vm_partition_constants else ''}
 return _h
@@ -497,15 +702,22 @@ end''')
 local {n['proto']}={n['protos']}[{n['i']}]
 local {n['tmp']}={n['hashproto']}({n['proto']})
 if {n['tmp']}~={n['proto']}.ih then error("VM: integrity check failed") end
+{n['proto']}.ih=nil
 end"""
 
     def _gen_bytecode_decode(self, n: Dict[str, str]) -> str:
+        verify_proto = (f'''if {n['salt']}(_p.bc)~=_p.ph then error("VM: integrity check failed") end
+_p.ph=nil''' if self.config.vm_integrity_check else '')
+        verify_shared = (f'''if {n['salt']}({n['bc']})~={n['protos']}[{n['i']}].ph then error("VM: integrity check failed") end
+{n['protos']}[{n['i']}].ph=nil''' if self.config.vm_integrity_check else '')
         if self.config.vm_per_proto_keys:
             return f'''local function {n['decode']}(_p)
 local _key=_p.bk
 {f"_key={n['unkey']}(_key,_p.ks)" if self.config.vm_dynamic_keys else ''}
 for _j=1,#_p.bc do _p.bc[_j]={n['bxor']}(_p.bc[_j],_key[(_j-1)%#_key+1]) end
-_p.bk=nil;_p.decoded=true
+for _j=1,#_p.bc do _p.bc[_j]={n['bxor']}(_p.bc[_j],(_j*_p.bm+_p.ba)%256) end
+{verify_proto}
+_p.bk=nil;_p.bm=nil;_p.ba=nil;_p.decoded=true
 _p.ks=nil
 end'''
         key = f"{n['protos']}[{n['i']}].bk" if self.config.vm_per_proto_keys else n['bk']
@@ -514,8 +726,12 @@ end'''
 local {n['bc']}={n['protos']}[{n['i']}].bc
 for {n['j']}=1,#{n['bc']} do
 {n['bc']}[{n['j']}]={n['bxor']}({n['bc']}[{n['j']}],{key}[({n['j']}-1)%{size}+1])
+{n['bc']}[{n['j']}]={n['bxor']}({n['bc']}[{n['j']}],({n['j']}*{n['protos']}[{n['i']}].bm+{n['protos']}[{n['i']}].ba)%256)
 end
-end"""
+{verify_shared}
+{n['protos']}[{n['i']}].bm=nil;{n['protos']}[{n['i']}].ba=nil
+end
+{n['bk']}=nil;{n['bkn']}=nil"""
 
     def _gen_call_helper(self, n: Dict[str, str]) -> str:
         # Common call arities avoid allocating an argument table entirely.
@@ -533,7 +749,7 @@ end"""
     # Exec function (the heart of the VM)
     # =================================================================
 
-    def _gen_exec_function(self, n: Dict[str, str]) -> str:
+    def _gen_exec_function(self, n: Dict[str, str], target: str) -> str:
         """Generate the main `exec` interpreter function."""
         # Build all opcode handler bodies
         handlers = self._build_handlers(n)
@@ -548,7 +764,7 @@ end"""
             body = h['body']
             if body.startswith(';'):
                 body = body[1:]
-            condition = ' or '.join(f"{n['op']}=={byte}" for byte in h['bytes'])
+            condition = ' or '.join(self._opcode_condition(n, byte) for byte in h['bytes'])
             chain_lines.append(f"{kw} {condition} then {body}")
         chain_lines.append("else error(\"VM: bad opcode \"..tostring(" + n['op'] + "))")
         chain_lines.append("end")
@@ -562,7 +778,7 @@ end"""
             hot,rest = handlers[:count],handlers[count:]
             nodes = []
             for index,handler in enumerate(hot):
-                condition = ' or '.join(f"{n['op']}=={byte}" for byte in handler['bytes'])
+                condition = ' or '.join(self._opcode_condition(n, byte) for byte in handler['bytes'])
                 nodes.append(f"{'if' if index==0 else 'elseif'} {condition} then {handler['body'].lstrip(';')}")
             nodes.append('else '+self._dispatch_tree(rest,n))
             nodes.append('end')
@@ -577,30 +793,80 @@ end"""
             function_data = f"if not {n['proto']}.decoded then {n['decode']}({n['proto']}) end;" + function_data
         if self.config.vm_per_proto_keys and not self.config.vm_predecode_bytecode:
             function_data += (';' if function_data else '') + f"local {n['bk']}={n['proto']}.bk;local {n['bkn']}=#{n['bk']}"
+        fetch_setup = ''
+        if self.config.vm_stateful_fetch and not self.config.vm_predecode_bytecode:
+            fetch_setup = f'''local _fs,_fn,_fi,_fh,_fx,_fc=0,0,0,0,0,{{}}
+local function {n['resetfetch']}(_p)
+_fx={n['proto']}.fx[_p];if not _fx then error("VM: invalid control edge") end
+_fs=({n['bxor']}({n['proto']}.f1,{n['proto']}.f2)+_p*{n['proto']}.fm+{n['proto']}.fa)%65536
+_fh=({n['proto']}.fts+_p*{n['proto']}.ftm)%4294967296;_fn=_p;_fi=0;_fc={{}}
+end
+local function {n['readbyte']}(_p)
+local _v=_fc[_p];if _v~=nil then _fc[_p]=nil;return _v end
+while _fn<=_p do
+local _x={n['bxor']}({n['bc']}[_fn],{n['bk']}[(_fn-1)%{n['bkn']}+1])
+_x={n['bxor']}(_x,(_fn*{n['proto']}.bm+{n['proto']}.ba)%256)
+local _hi,_lo=math.floor(_fs/256),_fs%256
+local _mask
+if {n['proto']}.ff==1 then _mask={n['bxor']}((_hi+{n['proto']}.fw)%256,_lo)
+elseif {n['proto']}.ff==2 then _mask={n['bxor']}(_hi,(_lo+{n['proto']}.fb)%256)
+else _mask={n['bxor']}(_hi,_lo) end
+_x={n['bxor']}(_x,_mask)
+_fi=_fi+1;_fc[_fn]=_x
+if {n['proto']}.ff==1 then
+_fs=(_fs*{n['proto']}.fq+_x*{n['proto']}.fw+_fi+{n['proto']}.fb)%65536
+else _fs=(_fs*{n['proto']}.fq+_x+_fi*{n['proto']}.fw+{n['proto']}.fb)%65536 end
+_fh=(_fh*{n['proto']}.ftm+_x+_fi*{n['proto']}.fw+{n['proto']}.fb)%4294967296
+_fn=_fn+1
+if _fi=={n['proto']}.fl[_fx] and _fh~={n['proto']}.ft[_fx] then error("VM: instruction authentication failed") end
+end
+_v=_fc[_p];_fc[_p]=nil;return _v
+end'''
+        runtime_guard = ''
+        if self.config.vm_runtime_integrity:
+            runtime_guard = f'''{n['proto']}.rc=({n['proto']}.rc or 1)-1
+if {n['proto']}.rc<=0 then
+if {n['salt']}({n['proto']}.bc)~={n['proto']}.rh then error("VM: integrity check failed") end
+{n['proto']}.rc={self.runtime_check_interval}
+end'''
 
         # The exec function
         # Reads operand bytes; pc is byte-offset (1-based for Lua array indexing).
         # Each handler uses its generated operand layout and byte order.
         # Signed sBx is biased by 0x8000 (32768) at encode time.
-        return f"""local {n['exec']}
-{n['exec']}=function({n['proto']},{n['upvals']},...)
+        return f"""{target}=function({n['proto']},{n['upvals']},...)
 {function_data}
+{runtime_guard}
 local {n['varargs']}
 if {n['proto']}.va then {n['varargs']}={n['pack']}(...) end
 local {n['nargs']}=select("#",...)
 local {n['R']}=table.create and table.create({n['proto']}.ms) or {{}}
 for {n['i']}=1,{n['proto']}.np do {n['R']}[{n['i']}-1]=select({n['i']},...) end
 local {n['bc']}={n['proto']}.bc
+{fetch_setup}
 local {n['sp']}={n['proto']}.sp
 local {n['pc']}=1
 local {n['top']}={n['proto']}.np
 local {n['box']}
 while true do
 if {n['pc']}>#{n['bc']} then return end
+{f"{n['resetfetch']}({n['pc']})" if self.config.vm_stateful_fetch and not self.config.vm_predecode_bytecode else ''}
 local {n['op']}={self._byte_expr(n,n['pc'])}; {n['pc']}={n['pc']}+1
+{n['op']}=((({n['op']}-{n['proto']}.oa)%256)*{n['proto']}.oi)%256
 {chain}
 end
 end"""
+
+    def _opcode_condition(self, n: Dict[str, str], byte: int) -> str:
+        """Emit equivalent, build-specific opcode predicates."""
+        shape = self.rng.randrange(4) if self.config.vm_handler_variants else 0
+        if shape == 1:
+            return f"({n['op']}-{byte})==0"
+        if shape == 2:
+            return f"({byte}-{n['op']})==0"
+        if shape == 3:
+            return f"not ({n['op']}~={byte})"
+        return f"{n['op']}=={byte}"
 
     # =================================================================
     # Handler construction
@@ -629,7 +895,7 @@ end"""
             if len(values)<=3:
                 lines=[]
                 for index,(byte,handler) in enumerate(values):
-                    lines.append(f"{'if' if index==0 else 'elseif'} {n['op']}=={byte} then {handler['body'].lstrip(';')}")
+                    lines.append(f"{'if' if index==0 else 'elseif'} {self._opcode_condition(n,byte)} then {handler['body'].lstrip(';')}")
                 lines.append(f'else error("VM: bad opcode "..tostring({n["op"]})) end')
                 return '\n'.join(lines)
             split=len(values)//2
@@ -649,6 +915,8 @@ end"""
             position = n['pc'] if slot==0 else f"{n['pc']}+{slot*2}"
             low,high = (position,position+'+1') if info.byte_order=='little' else (position+'+1',position)
             expression = f"{self._byte_expr(n,low)}+256*{self._byte_expr(n,high)}"
+            if self.config.vm_operand_layouts:
+                expression = f"{n['bxor']}({expression},(({position})*{n['proto']}.xm+{n['proto']}.xa)%65536)"
             reads.append(f'local {operands[index]}={expression}')
         reads.append(f"{n['pc']}={n['pc']}+{len(operands)*2}")
         bodies = []
@@ -667,7 +935,10 @@ end"""
     def _byte_expr(self, n: Dict[str,str], pos: str) -> str:
         if self.config.vm_predecode_bytecode:
             return f"{n['bc']}[{pos}]"
-        return f"{n['bxor']}({n['bc']}[{pos}],{n['bk']}[({pos}-1)%{n['bkn']}+1])"
+        if self.config.vm_stateful_fetch:
+            return f"{n['readbyte']}({pos})"
+        keyed = f"{n['bxor']}({n['bc']}[{pos}],{n['bk']}[({pos}-1)%{n['bkn']}+1])"
+        return f"{n['bxor']}({keyed},(({pos})*{n['proto']}.bm+{n['proto']}.ba)%256)"
 
     def _read_u16_inline(self, n: Dict[str, str], dest: str, byte_order='little') -> str:
         """Generate inline code to read a u16 from BC at PC, advancing PC."""
@@ -677,6 +948,8 @@ end"""
         expression = f'{low}+{high}*256'
         if self.config.vm_handler_variants and self.rng.randrange(2):
             expression = f'256*{high}+{low}'
+        if self.config.vm_operand_layouts:
+            expression = f"{bx}({expression},({pc}*{n['proto']}.xm+{n['proto']}.xa)%65536)"
         return (
             f"local {dest}={expression};"
             f"{pc}={pc}+2"
@@ -687,9 +960,12 @@ end"""
         bx, bc, bk, bkn, pc = n['bxor'], n['bc'], n['bk'], n['bkn'], n['pc']
         lo,hi = (pc,pc+'+1') if byte_order=='little' else (pc+'+1',pc)
         low,high = self._byte_expr(n,lo),self._byte_expr(n,hi)
-        expression = f'{low}+{high}*256-32768'
+        expression = f'{low}+{high}*256'
         if self.config.vm_handler_variants and self.rng.randrange(2):
-            expression = f'{high}*256-32768+{low}'
+            expression = f'{high}*256+{low}'
+        if self.config.vm_operand_layouts:
+            expression = f"{bx}({expression},({pc}*{n['proto']}.xm+{n['proto']}.xa)%65536)"
+        expression = f'{expression}-32768'
         return (
             f"local {dest}={expression};"
             f"{pc}={pc}+2"
@@ -699,8 +975,11 @@ end"""
         bx, bc, bk, bkn, pc, opsize = n['bxor'], n['bc'], n['bk'], n['bkn'], n['pc'], n['opsize']
         return (
             f"if {pc}>#{bc} then return end;"
+            + (f"{n['resetfetch']}({pc});" if self.config.vm_stateful_fetch and not self.config.vm_predecode_bytecode else '') +
             f"local _no={self._byte_expr(n,pc)};"
-            f"{pc}={pc}+1+{opsize}[_no]"
+            f"_no=(((_no-{n['proto']}.oa)%256)*{n['proto']}.oi)%256;"
+            f"local _nk={self._lookup_slot_expr('_no')};"
+            f"{pc}={pc}+1+{n['bxor']}({opsize}[_nk],{self._lookup_mask_expr('_nk')})"
         )
 
     def _read_operands(self, fmt: str, n: Dict[str, str], info) -> str:
@@ -969,19 +1248,25 @@ end"""
 
         if op_name == 'CLOSURE':
             # Read N pseudo-instructions for upvalue links
+            link_reset = (f"{n['resetfetch']}({PC});"
+                          if self.config.vm_stateful_fetch and not self.config.vm_predecode_bytecode else '')
             return ops + (
-                f";local _np={SP}[{b}+1];"
+                f";local _np={BXOR}({SP}[{b}+1],(({b}+1)*{n['proto']}.lm+{n['proto']}.la)%65536);"
                 f"local _newp={PROTOS}[_np];"
+                f"if not _newp then error('VM: invalid prototype relation') end;"
                 f"local _nuv=_newp.nuv;"
                 f"local _newuv={{}};"
-                f"for _i=1,_nuv do "
+                f"for _i=1,_nuv do {link_reset}"
                 f"local _po={self._byte_expr(n,PC)}; {PC}={PC}+1;"
+                f"_po=(((_po-{n['proto']}.oa)%256)*{n['proto']}.oi)%256;"
                 f"{self._read_u16_inline(n, '_pa')};"
                 f"{self._read_u16_inline(n, '_pb')};"
                 # Either MOVE or GETUPVAL (any alias).
                 # If it's any MOVE alias, capture local register (a box).
                 # If it's any GETUPVAL alias, share parent's upvalue.
-                f"if {ISMOVE}[_po] then _newuv[_i]={R}[_pb] "
+                f"local _pk={self._lookup_slot_expr('_po')};"
+                f"local _pm={self._lookup_mask_expr('_pk')};"
+                f"if {BXOR}({ISMOVE}[_pk] or _pm,_pm)==1 then _newuv[_i]={R}[_pb] "
                 f"else _newuv[_i]={UPVALS}[_pb+1] end "
                 f"end;"
                 f"local _np2=_newp;"
@@ -1021,12 +1306,15 @@ end"""
         """Lookup tables used by exec for skipping instructions and CLOSURE links."""
         # opsize: opcode-byte -> operand-block size (excludes opcode byte)
         size_entries = [
-            f"[{byte}]={instruction_size(info.fmt) - 1}"
+            f"[{self._lookup_slot(byte)}]={instruction_size(info.fmt) - 1 ^ self._lookup_mask(self._lookup_slot(byte))}"
             for byte, info in self.opcodes.all_aliases() if byte in self._used_aliases
         ]
         # ismove: opcode-byte -> true iff it's any MOVE alias
         move_aliases = self.opcodes.opcodes['MOVE'].aliases
-        ismove_entries = ','.join(f"[{v}]=true" for v in move_aliases)
+        ismove_entries = ','.join(
+            f"[{self._lookup_slot(v)}]={1 ^ self._lookup_mask(self._lookup_slot(v))}"
+            for v in move_aliases
+        )
         return (
             f"local {n['opsize']}={{{','.join(size_entries)}}}\n"
             f"local {n['ismove']}={{{ismove_entries}}}"

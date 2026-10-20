@@ -154,7 +154,14 @@ local a=table.pack(f());a[a.n+1]=1/a[3];a.n+=1;return table.unpack(a,1,a.n)''')
         self.assertEqual(run(output),run(source))
         fields=[r'bc=\{(\d+)', r'bk=\{q=\{(\d+)', r'ck=\{q=\{(\d+)',
                 r'\},s=(\d+)', r'kc=(\d+)', r'np=(\d+)', r'ms=(\d+)', r'sp=\{(\d+)',
-                r'pending=\{\[\d+\]=([12])', r'(?<!\w)k=\{[^}]*?\\(\d{3})']
+                r'bm=(\d+)', r'ba=(\d+)', r'om=(\d+)', r'oa=(\d+)', r'oi=(\d+)',
+                r'ix=(\d+)', r'f1=(\d+)', r'f2=(\d+)', r'fq=(\d+)', r'fw=(\d+)',
+                r'fb=(\d+)', r'ff=(\d+)', r'lm=(\d+)', r'la=(\d+)',
+                r'xm=(\d+)', r'xa=(\d+)',
+                r'fts=(\d+)', r'ftm=(\d+)', r'ft=\{(\d+)',
+                r'ph=(\d+)', r'rh=(\d+)',
+                r'pending=\{\[\d+\]=([12])',
+                r'(?<!\w)k=\{[^}]*?\\(\d{3})']
         for pattern in fields:
             match=re.search(pattern,output)
             self.assertIsNotNone(match,pattern)

@@ -1,8 +1,8 @@
 """
 Obscura Layer 8 — Anti-Tamper
 ==================================
-Injects Roblox environment validation, hook detection, timing checks,
-integrity verification, and IIFE wrapping for script protection.
+Injects Roblox environment validation, hook detection, repeated integrity
+verification, and IIFE wrapping for script protection.
 """
 
 from parser.ast_nodes import *
@@ -18,6 +18,7 @@ class AntiTamperInjector:
         self.config = config
         self.rng = config.get_rng()
         self.name_gen = NameGenerator(rng=self.rng, min_length=8, max_length=12)
+        self.guard_name = self.name_gen.gen_name()
 
     def _char_expr(self, value: str) -> Identifier:
         return Identifier(name='string.char(' + ','.join(str(ord(ch)) for ch in value) + ')')
@@ -25,6 +26,11 @@ class AntiTamperInjector:
     def apply(self, block: Block) -> Block:
         """Apply anti-tamper protections to the AST."""
         guards = []
+
+        # Add calls before inserting the guard implementation itself, so its
+        # internal helper closure is not instrumented recursively.
+        if self.config.check_integrity:
+            self._inject_function_guards(block)
 
         if self.config.check_environment:
             guards.extend(self._gen_env_check())
@@ -36,8 +42,13 @@ class AntiTamperInjector:
         if self.config.check_integrity:
             guards.extend(self._gen_integrity_check())
 
-        # Insert guards at the top
-        block.body = guards + block.body
+        # Run once during startup and once again immediately before the last
+        # top-level operation. Function bodies receive their own entry checks.
+        original = block.body
+        if self.config.check_integrity and original:
+            tail_index = max(0, len(original) - 1)
+            original = original[:tail_index] + [self._guard_call()] + original[tail_index:]
+        block.body = guards + original
 
         # Wrap everything in IIFE if configured
         if self.config.wrap_in_iife:
@@ -176,43 +187,104 @@ class AntiTamperInjector:
         return [backup] + checks
 
     def _gen_integrity_check(self) -> List[Node]:
-        """Generate function integrity verification."""
-        fn_sig = self.name_gen.gen_name()
-        target = self.name_gen.gen_name()
+        """Build a polymorphic guard tied to build-specific integrity data."""
+        names = {key: self.name_gen.gen_name() for key in (
+            'type', 'typeof', 'tostring', 'pcall', 'string', 'table', 'math',
+            'bit', 'error', 'game', 'data', 'counter', 'fail', 'hash', 'i',
+            'ok', 'result', 'challenge', 'states', 'token', 'state', 'start',
+            'index', 'expected',
+        )}
+        values = [self.rng.randint(0, 255) for _ in range(self.rng.randint(11, 19))]
+        seed = self.rng.randrange(4294967296)
+        multiplier = self.rng.randrange(257, 65536, 2)
+        digests = []
+        for start in range(len(values)):
+            digest = seed
+            for offset in range(len(values)):
+                digest = (digest * multiplier + values[(start + offset) % len(values)]) % 4294967296
+            digests.append(digest)
+        challenge_mask = self.rng.randrange(1, 0x1000000)
+        state_multiplier = self.rng.randrange(257, 65536, 2)
+        token_multiplier = self.rng.randrange(257, 65536, 2)
+        counter_multiplier = self.rng.randrange(257, 65536, 2)
+        state_add = self.rng.randrange(4294967296)
+        data = '{' + ','.join(str(value) for value in values) + '}'
+        expected = '{' + ','.join(str(value) for value in digests) + '}'
+        n = names
+        code = f'''local {self.guard_name}=(function()
+local {n['type']},{n['typeof']},{n['tostring']},{n['pcall']}=type,typeof,tostring,pcall
+local {n['string']},{n['table']},{n['math']},{n['bit']}=string,table,math,bit32
+local {n['error']},{n['game']}=error,game
+local {n['data']}={data}
+local {n['expected']}={expected}
+local {n['counter']}=0
+local {n['states']}={{}}
+local function {n['fail']}() return {n['error']}("") end
+return function({n['token']})
+{n['counter']}={n['counter']}+1
+if type~={n['type']} or typeof~={n['typeof']} or tostring~={n['tostring']} or pcall~={n['pcall']}
+or string~={n['string']} or table~={n['table']} or math~={n['math']} or bit32~={n['bit']}
+or error~={n['error']} or game~={n['game']} then return {n['fail']}() end
+local {n['state']}={n['states']}[{n['token']}] or {n['bit']}.bxor({seed},{n['token']})
+{n['state']}=({n['state']}*{state_multiplier}+{n['token']}*{token_multiplier}+{n['counter']}*{counter_multiplier}+{state_add})%4294967296
+{n['states']}[{n['token']}]={n['state']}
+local {n['start']}={n['state']}%#{n['data']}+1
+local {n['hash']}={seed}
+for {n['i']}=0,#{n['data']}-1 do
+local {n['index']}=({n['start']}+{n['i']}-1)%#{n['data']}+1
+{n['hash']}=({n['hash']}*{multiplier}+{n['data']}[{n['index']}])%4294967296
+end
+if {n['hash']}~={n['expected']}[{n['start']}] then return {n['fail']}() end
+local {n['challenge']}={n['bit']}.bxor(({n['state']}+{n['counter']}*{challenge_mask})%4294967296,{challenge_mask})
+if {n['bit']}.bxor({n['challenge']},{challenge_mask})~=({n['state']}+{n['counter']}*{challenge_mask})%4294967296 then return {n['fail']}() end
+local {n['ok']},{n['result']}={n['pcall']}(function()
+return {n['type']}({n['type']})=="function"
+and {n['type']}({n['typeof']})=="function"
+and {n['type']}({n['string']})=="table"
+and {n['type']}({n['table']})=="table"
+and {n['type']}({n['math']})=="table"
+and {n['type']}({n['bit']})=="table"
+and {n['string']}.byte({n['string']}.char(83,69,78,84),1)==83
+and {n['string']}.sub({n['string']}.char(83,69,78,84),2,4)=="ENT"
+and {n['table']}.concat({{"S","E","N"}})=="SEN"
+and {n['math']}.floor(511/2)==255
+and {n['bit']}.bxor(165,90)==255
+and {n['bit']}.band(255,90)==90
+and {n['tostring']}(65535)=="65535"
+end)
+if not {n['ok']} or not {n['result']} then return {n['fail']}() end
+if getgenv~=nil or hookfunction~=nil or getrawmetatable~=nil or newcclosure~=nil or checkcaller~=nil then return {n['fail']}() end
+return true
+end
+end)()'''
+        return [
+            ExpressionStatement(expression=Identifier(name=code)),
+            self._guard_call(),
+        ]
 
-        return [DoBlock(body=Block(body=[
-            # Store a reference and its string form
-            LocalStatement(
-                names=[target],
-                values=[Identifier(name='print')]
-            ),
-            LocalStatement(
-                names=[fn_sig],
-                values=[FunctionCall(
-                    func=Identifier(name='tostring'),
-                    args=[Identifier(name=target)]
-                )]
-            ),
-            # Later check it hasn't changed
-            IfStatement(
-                condition=BinaryOp(
-                    op='~=',
-                    left=FunctionCall(
-                        func=Identifier(name='tostring'),
-                        args=[Identifier(name=target)]
-                    ),
-                    right=Identifier(name=fn_sig)
-                ),
-                body=Block(body=[
-                    ExpressionStatement(expression=FunctionCall(
-                        func=Identifier(name='error'),
-                        args=[StringLiteral(value='')]
-                    ))
-                ]),
-                elseif_clauses=[],
-                else_body=None
-            )
-        ]))]
+    def _guard_call(self) -> ExpressionStatement:
+        return ExpressionStatement(expression=FunctionCall(
+            func=Identifier(name=self.guard_name),
+            args=[NumberLiteral(value=str(self.rng.randrange(1, 0x1000000)))]
+        ))
+
+    def _inject_function_guards(self, node: Node):
+        """Invoke the integrity guard at each protected function entry."""
+        if node is None or isinstance(node, Identifier):
+            return
+        for value in vars(node).values():
+            if isinstance(value, (FunctionDecl, FunctionExpr)):
+                self._inject_function_guards(value.body)
+                value.body.body.insert(0, self._guard_call())
+            elif isinstance(value, Node):
+                self._inject_function_guards(value)
+            elif isinstance(value, list):
+                for child in value:
+                    if isinstance(child, (FunctionDecl, FunctionExpr)):
+                        self._inject_function_guards(child.body)
+                        child.body.body.insert(0, self._guard_call())
+                    elif isinstance(child, Node):
+                        self._inject_function_guards(child)
 
     def _wrap_in_iife(self, block: Block) -> Block:
         """Isolate locals while forwarding chunk arguments and return values."""

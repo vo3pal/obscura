@@ -22,16 +22,21 @@ local {key_var}={key_table}
 local {cache_var}={{}}
 local {mask_var}={token_mask}
 local {kmask_var}={key_mask}
+local {order_var}={order_table}
+local {size_var}={size_table}
+local {checksum_var}={checksum_table}
 return function({s_var},{token_var},{idx_var})
 local {cached_var}={cache_var}[{idx_var}]
 if {cached_var} then return {cached_var} end
 local {seedpack_var}=bit32.bxor({token_var},{mask_var}+{idx_var}*131)
 local {seed_var}=math.floor({seedpack_var}/256)
 local {step_var}={seedpack_var}-{seed_var}*256
+{double_setup}
 local {result_var}={{}}
 local {ri_var}=1
 local {buf_var}=0
 local {bits_var}=0
+local {hash_var}=0
 for {ci_var}=1,#({s_var}) do
 local {ch_var}=string.sub({s_var},{ci_var},{ci_var})
 local {val_var}={lookup_var}[{ch_var}]
@@ -42,13 +47,17 @@ if {bits_var}>=8 then
 {bits_var}={bits_var}-8
 local {byte_var}=math.floor({buf_var}/2^{bits_var})
 {buf_var}={buf_var}-{byte_var}*2^{bits_var}
-local {key_idx_var}=(({ri_var}+{seed_var}+{idx_var})%#{key_var})+1
-local {dyn_key_var}=({seed_var}+{ri_var}*{step_var}+bit32.bxor({key_var}[{key_idx_var}],{kmask_var})+{idx_var}*17)%256
-{result_var}[{ri_var}]=string.char(bit32.bxor({byte_var},{dyn_key_var}))
+{hash_var}=({hash_var}*{hash_multiplier}+{byte_var})%4294967296
+local {pos_var}=({order_var}[{idx_var}]==1) and ({size_var}[{idx_var}]-{ri_var}+1) or {ri_var}
+local {key_idx_var}=(({pos_var}+{seed_var}+{idx_var})%#{key_var})+1
+local {dyn_key_var}=({seed_var}+{pos_var}*{step_var}+bit32.bxor({key_var}[{key_idx_var}],{kmask_var})+{idx_var}*17)%256
+{double_key}
+{result_var}[{pos_var}]=string.char({decrypt_expr})
 {ri_var}={ri_var}+1
 end
 end
 end
+if {hash_var}~={checksum_var}[{idx_var}] then error("") end
 local {out_var}=table.concat({result_var})
 {cache_var}[{idx_var}]={out_var}
 return {out_var}
@@ -61,16 +70,26 @@ end)()'''
 EAGER_DECODER_TEMPLATE = '''local {decoder_name}=(function()
 local {key_var}={key_table}
 for {i_var}=1,#{key_var} do {key_var}[{i_var}]=bit32.bxor({key_var}[{i_var}],{key_mask}) end
+local {order_var}={order_table}
+local {size_var}={size_table}
+local {checksum_var}={checksum_table}
 return function({s_var},{token_var},{idx_var})
 local {seedpack_var}=bit32.bxor({token_var},{token_mask}+{idx_var}*131)
 local {seed_var}=math.floor({seedpack_var}/256)
 local {step_var}={seedpack_var}-{seed_var}*256
+{double_setup}
 local {result_var}=table.create and table.create(#{s_var}) or {{}}
+local {hash_var}=0
 for {ri_var}=1,#{s_var} do
-local {key_idx_var}=(({ri_var}+{seed_var}+{idx_var})%#{key_var})+1
-local {dyn_key_var}=({seed_var}+{ri_var}*{step_var}+{key_var}[{key_idx_var}]+{idx_var}*17)%256
-{result_var}[{ri_var}]=string.char(bit32.bxor(string.byte({s_var},{ri_var}),{dyn_key_var}))
+local {byte_var}=string.byte({s_var},{ri_var})
+{hash_var}=({hash_var}*{hash_multiplier}+{byte_var})%4294967296
+local {pos_var}=({order_var}[{idx_var}]==1) and ({size_var}[{idx_var}]-{ri_var}+1) or {ri_var}
+local {key_idx_var}=(({pos_var}+{seed_var}+{idx_var})%#{key_var})+1
+local {dyn_key_var}=({seed_var}+{pos_var}*{step_var}+{key_var}[{key_idx_var}]+{idx_var}*17)%256
+{double_key}
+{result_var}[{pos_var}]=string.char({decrypt_expr})
 end
+if {hash_var}~={checksum_var}[{idx_var}] then error("") end
 return table.concat({result_var})
 end
 end)()'''
@@ -83,15 +102,22 @@ class StringEncryptor:
         self.config = config
         self.rng = config.get_rng()
         self.name_gen = NameGenerator(rng=self.rng, min_length=8, max_length=12)
-        self.strings: List[Tuple[str, str, int, int]] = []
+        self.strings: List[Tuple[str, str, int, int, int]] = []
         self._indices = {}
         self._bindings = {}
+        self._reverse = {}
+        self._sizes = {}
+        self._checksums = {}
         self.decoder_name = self.name_gen.gen_name()
         self.table_name = self.name_gen.gen_name()
         self.index_key = self.rng.randint(1, 0xFFFF)
         self.token_mask = self.rng.randint(0x1000, 0xFFFF)
         self.key_mask = self.rng.randint(1, 255)
         self.master_key = [self.rng.randint(1, 255) for _ in range(self.rng.randint(6, 13))]
+        self.second_key_mask = self.rng.randint(1, 255)
+        self.second_master_key = [self.rng.randint(1, 255)
+                                  for _ in range(self.rng.randint(7, 15))]
+        self.payload_hash_multiplier = self.rng.randrange(257, 65536, 2)
 
     def apply(self, block: Block) -> Block:
         """Apply string encryption to the AST."""
@@ -173,8 +199,8 @@ class StringEncryptor:
         idx = self._indices.get(string_node.value)
         if idx is None:
             idx = len(self.strings) + 1
-            encrypted, token = self._encrypt_string(string_node.value, idx)
-            self.strings.append((string_node.value, encrypted, token, idx))
+            encrypted, token, token2 = self._encrypt_string(string_node.value, idx)
+            self.strings.append((string_node.value, encrypted, token, token2, idx))
             self._indices[string_node.value] = idx
             if self.config.string_decode_mode == 'eager' and len(self._bindings) < self._binding_budget:
                 self._bindings[idx] = self.name_gen.gen_name()
@@ -202,21 +228,38 @@ class StringEncryptor:
         """Replace a string literal in a list with a decoder call."""
         lst[idx] = self._string_expr(string_node)
 
-    def _encrypt_string(self, value: str, idx: int) -> Tuple[str, int]:
+    def _encrypt_string(self, value: str, idx: int) -> Tuple[str, int, int]:
         seed = self.rng.randint(1, 255)
         step = self.rng.randrange(1, 252, 2)
+        seed2 = self.rng.randint(1, 255)
+        step2 = self.rng.randrange(1, 252, 2)
         encrypted = []
         for pos, byte in enumerate(value.encode('utf-8','surrogateescape'), start=1):
             key_byte = self.master_key[(pos + seed + idx) % len(self.master_key)]
             dyn_key = (seed + pos * step + key_byte + idx * 17) % 256
-            encrypted.append(byte ^ dyn_key)
+            encoded = byte ^ dyn_key
+            if self.config.double_encrypt:
+                key_byte2 = self.second_master_key[(pos + seed2 + idx) % len(self.second_master_key)]
+                dyn_key2 = (seed2 + pos * step2 + key_byte2 + idx * 29) % 256
+                encoded = (encoded + dyn_key2) % 256
+            encrypted.append(encoded)
         token = ((seed * 256 + step) ^ (self.token_mask + idx * 131))
+        token2 = ((seed2 * 256 + step2) ^ (self.token_mask + idx * 197))
+        reverse = bool(self.rng.getrandbits(1)) and len(encrypted) > 1
+        if reverse:
+            encrypted.reverse()
         payload = bytes(encrypted)
+        checksum = 0
+        for byte in payload:
+            checksum = (checksum * self.payload_hash_multiplier + byte) % 4294967296
+        self._reverse[idx] = int(reverse)
+        self._sizes[idx] = len(payload)
+        self._checksums[idx] = checksum
         if self.config.string_decode_mode == 'eager':
             # Surrogateescape lets the byte-aware emitter preserve invalid
             # UTF-8 and embedded NUL bytes without re-encoding them.
-            return payload.decode('utf-8', 'surrogateescape'), token
-        return b64_encode(payload), token
+            return payload.decode('utf-8', 'surrogateescape'), token, token2
+        return b64_encode(payload), token, token2
 
     def _make_index_expr(self, idx: int) -> FunctionCall:
         return FunctionCall(
@@ -236,7 +279,7 @@ class StringEncryptor:
 
         # Build string table: local TABLE = {"enc1", "enc2", ...}
         fields = []
-        for _, encrypted, _, idx in self.strings:
+        for _, encrypted, _, _, idx in self.strings:
             fields.append(TableField(
                 key=NumberLiteral(value=str(idx)),
                 value=StringLiteral(value=encrypted),
@@ -253,7 +296,7 @@ class StringEncryptor:
         if self.config.string_decode_mode == 'eager':
             # Startup-only scope: user code reads the decoded pool directly.
             body = [ExpressionStatement(expression=Identifier(name=self._generate_decoder()))]
-            for _, _, token, idx in self.strings:
+            for _, _, token, _, idx in self.strings:
                 def entry():
                     return IndexExpr(object=Identifier(name=self.table_name),
                                      index=NumberLiteral(value=str(idx)))
@@ -305,11 +348,43 @@ class StringEncryptor:
             'step_var': self.name_gen.gen_name(),
             'key_idx_var': self.name_gen.gen_name(),
             'dyn_key_var': self.name_gen.gen_name(),
+            'pos_var': self.name_gen.gen_name(),
+            'order_var': self.name_gen.gen_name(),
+            'size_var': self.name_gen.gen_name(),
+            'checksum_var': self.name_gen.gen_name(),
+            'hash_var': self.name_gen.gen_name(),
+            'seedpack2_var': self.name_gen.gen_name(),
+            'seed2_var': self.name_gen.gen_name(),
+            'step2_var': self.name_gen.gen_name(),
+            'key2_var': self.name_gen.gen_name(),
+            'key_idx2_var': self.name_gen.gen_name(),
+            'dyn_key2_var': self.name_gen.gen_name(),
             'out_var': self.name_gen.gen_name(),
             'key_table': '{' + ','.join(str(byte ^ self.key_mask) for byte in self.master_key) + '}',
             'token_mask': self.token_mask,
             'key_mask': self.key_mask,
+            'order_table': '{' + ','.join(str(self._reverse[i]) for i in range(1, len(self.strings) + 1)) + '}',
+            'size_table': '{' + ','.join(str(self._sizes[i]) for i in range(1, len(self.strings) + 1)) + '}',
+            'checksum_table': '{' + ','.join(str(self._checksums[i]) for i in range(1, len(self.strings) + 1)) + '}',
+            'hash_multiplier': self.payload_hash_multiplier,
         }
+        if self.config.double_encrypt:
+            token2_by_index = '{' + ','.join(str(item[3]) for item in self.strings) + '}'
+            names['double_setup'] = (
+                f"local {names['key2_var']}={{{','.join(str(byte ^ self.second_key_mask) for byte in self.second_master_key)}}}\n"
+                f"for {names['i_var']}=1,#{names['key2_var']} do {names['key2_var']}[{names['i_var']}]=bit32.bxor({names['key2_var']}[{names['i_var']}],{self.second_key_mask}) end\n"
+                f"local {names['seedpack2_var']}=bit32.bxor(({token2_by_index})[{names['idx_var']}],{self.token_mask}+{names['idx_var']}*197)\n"
+                f"local {names['seed2_var']}=math.floor({names['seedpack2_var']}/256)\n"
+                f"local {names['step2_var']}={names['seedpack2_var']}-{names['seed2_var']}*256")
+            names['double_key'] = (
+                f"local {names['key_idx2_var']}=(({names['pos_var']}+{names['seed2_var']}+{names['idx_var']})%#{names['key2_var']})+1\n"
+                f"local {names['dyn_key2_var']}=({names['seed2_var']}+{names['pos_var']}*{names['step2_var']}+{names['key2_var']}[{names['key_idx2_var']}]+{names['idx_var']}*29)%256")
+            names['decrypt_expr'] = (f"bit32.bxor(({names['byte_var']}-{names['dyn_key2_var']})%256,"
+                                     f"{names['dyn_key_var']})")
+        else:
+            names['double_setup'] = ''
+            names['double_key'] = ''
+            names['decrypt_expr'] = f"bit32.bxor({names['byte_var']},{names['dyn_key_var']})"
         template = DECODER_TEMPLATE
         if self.config.string_decode_mode == 'eager':
             template = EAGER_DECODER_TEMPLATE

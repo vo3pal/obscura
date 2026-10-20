@@ -87,6 +87,12 @@ class ObfuscationConfig:
     vm_encode_numbers: Optional[bool] = None
     vm_handler_variants: Optional[bool] = None
     vm_superinstructions: Optional[bool] = None
+    vm_position_keys: Optional[bool] = None
+    vm_shuffle_prototypes: Optional[bool] = None
+    vm_per_proto_opcodes: Optional[bool] = None
+    vm_multi_interpreters: Optional[bool] = None
+    vm_runtime_integrity: Optional[bool] = None
+    vm_stateful_fetch: Optional[bool] = None # Rolling instruction-local recovery
     vm_predecode_bytecode: bool = False   # Rolling reads by default; True caches decoded bytecode
 
     # --- Global Settings ---
@@ -117,6 +123,7 @@ class ObfuscationConfig:
         self.inject_dead_code = lv >= ProtectionLevel.STANDARD.value
         self.table_indirection = lv >= ProtectionLevel.MAXIMUM.value
         self.anti_tamper = lv >= ProtectionLevel.MAXIMUM.value
+        self.double_encrypt = lv >= ProtectionLevel.MAXIMUM.value
         self.virtualize = lv >= ProtectionLevel.PARANOID.value
         if lv >= ProtectionLevel.PARANOID.value:
             self.vm_hardening = self.vm_hardening or "max"
@@ -139,6 +146,12 @@ class ObfuscationConfig:
             'vm_encode_numbers': hardened,
             'vm_handler_variants': hardened,
             'vm_superinstructions': hardened,
+            'vm_position_keys': hardened,
+            'vm_shuffle_prototypes': hardened,
+            'vm_per_proto_opcodes': hardened,
+            'vm_multi_interpreters': self.vm_hardening == 'max',
+            'vm_runtime_integrity': hardened,
+            'vm_stateful_fetch': self.vm_hardening == 'max',
         }
         for name,value in defaults.items():
             if getattr(self,name) is None:

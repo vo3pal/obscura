@@ -89,7 +89,7 @@ class NumberObfuscator:
 
     def _gen_expression(self, n: int) -> str:
         """Generate an obfuscated expression that evaluates to n."""
-        strategy = self.rng.randint(0, 3)
+        strategy = self.rng.randint(0, 5)
 
         if strategy == 0:
             # Simple arithmetic: (n + r) - r
@@ -99,7 +99,7 @@ class NumberObfuscator:
                 return f"{inner}-{r}"
             return f"{n + r}-{r}"
 
-        elif strategy == 1:
+        elif strategy == 1 and n >= 0:
             # XOR identity: bxor(bxor(n, k), k) = n
             k = self.rng.randint(1, 0xFF)
             xored = n ^ k
@@ -110,19 +110,32 @@ class NumberObfuscator:
             m = self.rng.choice([2, 4, 5, 8, 10])
             return f"math.floor({n * m}/{m})"
 
-        else:
+        elif strategy == 3:
             # Addition decomposition: a + b where a + b = n
             a = self.rng.randint(1, max(2, abs(n) + 100))
             b = n - a
-            if self.depth >= 2 and self.rng.random() > 0.5:
+            if n >= 0 and self.depth >= 2 and self.rng.random() > 0.5:
                 k = self.rng.randint(1, 0xFF)
                 return f"bit32.bxor({a ^ k},{(a ^ n) ^ k})"
             return f"({a}+({b}))"
 
+        elif strategy == 4:
+            # Affine reconstruction. Keep all intermediates comfortably below
+            # the exact-integer range shared by Lua/Luau doubles.
+            m = self.rng.choice([3, 5, 7, 9, 11])
+            r = self.rng.randint(17, 997)
+            return f"math.floor((({n * m + r})-{r})/{m})"
+
+        else:
+            # Mirrored subtraction has a different shape from an additive
+            # split and works for positive and negative values alike.
+            pivot = self.rng.randint(abs(n) + 19, abs(n) + 2048)
+            return f"({pivot}-({pivot - n}))"
+
     def _gen_inner(self, n: int) -> str:
         """Generate a nested inner expression."""
         k = self.rng.randint(1, 0xFF)
-        if self.rng.random() > 0.5:
+        if n >= 0 and self.rng.random() > 0.5:
             return f"bit32.bxor({n ^ k},{k})"
         r2 = self.rng.randint(1, 100)
         return f"({n + r2}-{r2})"

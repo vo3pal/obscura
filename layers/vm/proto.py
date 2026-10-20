@@ -39,6 +39,29 @@ class FunctionPrototype:
     line_info: List[int] = field(default_factory=list)  # parallel to instructions
     constant_pool: Optional[ConstantPool] = None
     bytecode_key: List[int] = field(default_factory=list)
+    bytecode_mul: int = 0
+    bytecode_add: int = 0
+    opcode_mul: int = 1
+    opcode_add: int = 0
+    opcode_inverse: int = 1
+    interpreter_index: int = 1
+    fetch_seed: int = 0
+    fetch_share: int = 0
+    fetch_mul: int = 0
+    fetch_add: int = 0
+    fetch_step: int = 251
+    fetch_byte: int = 17
+    fetch_bias: int = 23
+    fetch_tag_seed: int = 0
+    fetch_tag_mul: int = 0
+    fetch_family: int = 0
+    proto_link_mul: int = 0
+    proto_link_add: int = 0
+    operand_mul: int = 0
+    operand_add: int = 0
+    fetch_positions: List[int] = field(default_factory=list)
+    fetch_lengths: List[int] = field(default_factory=list)
+    fetch_tags: List[int] = field(default_factory=list)
 
     def add_proto(self, proto: 'FunctionPrototype') -> int:
         """Add a nested function prototype, return its index."""

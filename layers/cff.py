@@ -12,7 +12,8 @@ from config import ObfuscationConfig
 from typing import List
 
 
-def _append_state_transition(clause_body: Block, stmts: list, i: int, state_var: str, state_values: list, cff_instance):
+def _append_state_transition(clause_body: Block, stmts: list, i: int, state_var: str,
+                             state_values: list, bridge_values: dict, cff_instance):
     """Appends state assignment or break safely, avoiding 'return ... break' syntax errors."""
     if not clause_body.body:
         return
@@ -29,7 +30,8 @@ def _append_state_transition(clause_body: Block, stmts: list, i: int, state_var:
             return
 
     if i + 1 < len(stmts):
-        next_state_expr = cff_instance._make_state_assign(state_var, state_values[i + 1])
+        next_state = bridge_values.get(i, state_values[i + 1])
+        next_state_expr = cff_instance._make_state_assign(state_var, next_state)
         clause_body.body.append(next_state_expr)
     else:
         clause_body.body.append(BreakStatement())
@@ -213,12 +215,25 @@ class ControlFlowFlattener:
         while terminal_state in used:
             terminal_state = self.name_gen.gen_state_value()
 
+        # Some real edges pass through a build-specific bridge state. Unlike
+        # unreachable junk cases, these states are part of the actual graph,
+        # which makes simple reachability-based cleanup less effective.
+        bridge_values = {}
+        for i in range(len(stmts) - 1):
+            if self.rng.random() < 0.4:
+                bridge = self.name_gen.gen_state_value()
+                while bridge in used or bridge == terminal_state:
+                    bridge = self.name_gen.gen_state_value()
+                used.add(bridge)
+                bridge_values[i] = bridge
+
         state_var = self.name_gen.gen_name()
 
         # Build the if-elseif chain
         # First state
         first_clause_body = Block(body=list(stmts[0:1]))
-        _append_state_transition(first_clause_body, stmts, 0, state_var, state_values, self)
+        _append_state_transition(first_clause_body, stmts, 0, state_var, state_values,
+                                 bridge_values, self)
 
         # Build the if statement
         condition = BinaryOp(
@@ -241,7 +256,8 @@ class ControlFlowFlattener:
         # Add elseif clauses for remaining states
         for i in range(1, len(stmts)):
             clause_body = Block(body=[stmts[i]])
-            _append_state_transition(clause_body, stmts, i, state_var, state_values, self)
+            _append_state_transition(clause_body, stmts, i, state_var, state_values,
+                                     bridge_values, self)
 
             elseif = ElseIfClause(
                 condition=BinaryOp(
@@ -252,6 +268,28 @@ class ControlFlowFlattener:
                 body=clause_body
             )
             if_stmt.elseif_clauses.append(elseif)
+
+        for source_index, bridge in bridge_values.items():
+            fake_name = self.name_gen.gen_name()
+            noise = self.rng.randint(0x100, 0xFFFF)
+            bridge_body = Block(body=[
+                LocalStatement(names=[fake_name], values=[NumberLiteral(value=str(noise))]),
+                AssignStatement(
+                    targets=[Identifier(name=fake_name)],
+                    values=[FunctionCall(
+                        func=MemberExpr(object=Identifier(name='bit32'), member='bxor'),
+                        args=[Identifier(name=fake_name), NumberLiteral(value=str(noise))]
+                    )]
+                ),
+                self._make_state_assign(state_var, state_values[source_index + 1]),
+            ])
+            if_stmt.elseif_clauses.append(ElseIfClause(
+                condition=BinaryOp(
+                    op='==', left=Identifier(name=state_var),
+                    right=NumberLiteral(value=str(bridge)),
+                ),
+                body=bridge_body,
+            ))
 
         # Shuffle the elseif order (but keep the if as first state)
         self.rng.shuffle(if_stmt.elseif_clauses)
